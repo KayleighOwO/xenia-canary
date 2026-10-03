@@ -160,7 +160,7 @@ void ReadGameConfig(const std::filesystem::path& file_path) {
 
     const auto config_key_node = config.at_path(config_key);
     if (config_key_node) {
-      config_var->LoadConfigValue(config_key_node.node());
+      config_var->LoadGameConfigValue(config_key_node.node());
     }
   }
   XELOGI("Loaded game config: {}", file_path);
