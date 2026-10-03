@@ -1,0 +1,494 @@
+/**
+ ******************************************************************************
+ * Xenia : Xbox 360 Emulator Research Project                                 *
+ ******************************************************************************
+ * Copyright 2026 Xenia Canary. All rights reserved.                          *
+ * Released under the BSD license - see LICENSE in the root for more details. *
+ ******************************************************************************
+ */
+
+#include "xenia/app/settings_model.h"
+
+#include <algorithm>
+#include <exception>
+#include <fstream>
+#include <limits>
+#include <type_traits>
+
+#include "third_party/fmt/include/fmt/format.h"
+#include "xenia/base/filesystem.h"
+#include "xenia/base/logging.h"
+#include "xenia/config.h"
+
+namespace xe {
+namespace app {
+
+namespace {
+
+template <class T>
+cvar::ConfigVar<T>* Typed(cvar::IConfigVar* var) {
+  return dynamic_cast<cvar::ConfigVar<T>*>(var);
+}
+
+std::vector<std::string> SplitCategory(const std::string& category) {
+  // Categories are nested tables in the config file ("GPU.Debug" is the table
+  // Debug inside the table GPU), exactly like config.cc looks them up.
+  std::vector<std::string> parts;
+  size_t start = 0;
+  while (true) {
+    const size_t dot = category.find('.', start);
+    if (dot == std::string::npos) {
+      parts.push_back(category.substr(start));
+      break;
+    }
+    parts.push_back(category.substr(start, dot - start));
+    start = dot + 1;
+  }
+  return parts;
+}
+
+const toml::node* FindNode(const toml::table& root, const SettingInfo& info) {
+  const toml::table* table = &root;
+  for (const std::string& part : SplitCategory(info.category)) {
+    table = table->get_as<toml::table>(part);
+    if (!table) {
+      return nullptr;
+    }
+  }
+  return table->get(info.name);
+}
+
+// Returns the table that holds the option, creating it if asked to.
+toml::table* FindParentTable(toml::table& root, const SettingInfo& info,
+                             bool create) {
+  toml::table* table = &root;
+  for (const std::string& part : SplitCategory(info.category)) {
+    toml::table* child = table->get_as<toml::table>(part);
+    if (!child) {
+      if (!create || table->contains(part)) {
+        // Missing, or something that isn't a table is in the way.
+        return nullptr;
+      }
+      child = table->emplace<toml::table>(part).first->second.as_table();
+    }
+    table = child;
+  }
+  return table;
+}
+
+// Erases the option and any tables left empty. Returns whether `table` is
+// empty afterwards.
+bool EraseAndPrune(toml::table& table, const std::vector<std::string>& parts,
+                   size_t index, const std::string& name) {
+  if (index == parts.size()) {
+    table.erase(name);
+    return table.empty();
+  }
+  toml::table* child = table.get_as<toml::table>(parts[index]);
+  if (child && EraseAndPrune(*child, parts, index + 1, name)) {
+    table.erase(parts[index]);
+  }
+  return table.empty();
+}
+
+size_t CountLeaves(const toml::table& table) {
+  size_t count = 0;
+  for (const auto& entry : table) {
+    if (const toml::table* child = entry.second.as_table()) {
+      count += CountLeaves(*child);
+    } else {
+      ++count;
+    }
+  }
+  return count;
+}
+
+template <class T>
+SettingValue Widen(const T& value) {
+  return SettingValue(value);
+}
+
+}  // namespace
+
+SettingType SettingsModel::TypeOf(cvar::IConfigVar* var) {
+  if (Typed<bool>(var)) return SettingType::kBool;
+  if (Typed<int32_t>(var)) return SettingType::kInt32;
+  if (Typed<uint32_t>(var)) return SettingType::kUint32;
+  if (Typed<int64_t>(var)) return SettingType::kInt64;
+  if (Typed<uint64_t>(var)) return SettingType::kUint64;
+  if (Typed<double>(var)) return SettingType::kDouble;
+  if (Typed<std::string>(var)) return SettingType::kString;
+  if (Typed<std::filesystem::path>(var)) return SettingType::kPath;
+  return SettingType::kUnknown;
+}
+
+std::vector<SettingInfo> SettingsModel::Enumerate() {
+  std::vector<SettingInfo> settings;
+  if (!cvar::ConfigVars) {
+    return settings;
+  }
+  for (const auto& entry : *cvar::ConfigVars) {
+    cvar::IConfigVar* var = entry.second;
+    // Transient options are never written to the config; defaults_date is an
+    // internal bookkeeping value that must not be touched.
+    if (!var || var->is_transient() || var->name() == "defaults_date") {
+      continue;
+    }
+    SettingInfo info;
+    info.var = var;
+    info.name = var->name();
+    info.category = var->category();
+    info.description = var->description();
+    info.type = TypeOf(var);
+    settings.push_back(std::move(info));
+  }
+  std::sort(settings.begin(), settings.end(),
+            [](const SettingInfo& a, const SettingInfo& b) {
+              if (a.category != b.category) {
+                return a.category < b.category;
+              }
+              return a.name < b.name;
+            });
+  return settings;
+}
+
+bool SettingsModel::Lookup(std::string_view name, SettingInfo* out_info) {
+  if (!cvar::ConfigVars) {
+    return false;
+  }
+  const auto it = cvar::ConfigVars->find(std::string(name));
+  if (it == cvar::ConfigVars->end() || !it->second ||
+      it->second->is_transient()) {
+    return false;
+  }
+  if (out_info) {
+    cvar::IConfigVar* var = it->second;
+    out_info->var = var;
+    out_info->name = var->name();
+    out_info->category = var->category();
+    out_info->description = var->description();
+    out_info->type = TypeOf(var);
+  }
+  return true;
+}
+
+SettingValue SettingsModel::GetSaved(const SettingInfo& info) {
+  switch (info.type) {
+    case SettingType::kBool:
+      return Widen(Typed<bool>(info.var)->GetTypedConfigValue());
+    case SettingType::kInt32:
+      return Widen(Typed<int32_t>(info.var)->GetTypedConfigValue());
+    case SettingType::kUint32:
+      return Widen(Typed<uint32_t>(info.var)->GetTypedConfigValue());
+    case SettingType::kInt64:
+      return Widen(Typed<int64_t>(info.var)->GetTypedConfigValue());
+    case SettingType::kUint64:
+      return Widen(Typed<uint64_t>(info.var)->GetTypedConfigValue());
+    case SettingType::kDouble:
+      return Widen(Typed<double>(info.var)->GetTypedConfigValue());
+    case SettingType::kString:
+      return Widen(Typed<std::string>(info.var)->GetTypedConfigValue());
+    case SettingType::kPath:
+      return SettingValue(xe::path_to_utf8(
+          Typed<std::filesystem::path>(info.var)->GetTypedConfigValue()));
+    default:
+      return SettingValue(std::string());
+  }
+}
+
+SettingValue SettingsModel::GetDefault(const SettingInfo& info) {
+  switch (info.type) {
+    case SettingType::kBool:
+      return Widen(Typed<bool>(info.var)->GetTypedDefaultValue());
+    case SettingType::kInt32:
+      return Widen(Typed<int32_t>(info.var)->GetTypedDefaultValue());
+    case SettingType::kUint32:
+      return Widen(Typed<uint32_t>(info.var)->GetTypedDefaultValue());
+    case SettingType::kInt64:
+      return Widen(Typed<int64_t>(info.var)->GetTypedDefaultValue());
+    case SettingType::kUint64:
+      return Widen(Typed<uint64_t>(info.var)->GetTypedDefaultValue());
+    case SettingType::kDouble:
+      return Widen(Typed<double>(info.var)->GetTypedDefaultValue());
+    case SettingType::kString:
+      return Widen(Typed<std::string>(info.var)->GetTypedDefaultValue());
+    case SettingType::kPath:
+      return SettingValue(xe::path_to_utf8(
+          Typed<std::filesystem::path>(info.var)->GetTypedDefaultValue()));
+    default:
+      return SettingValue(std::string());
+  }
+}
+
+SettingValue SettingsModel::GetInUse(const SettingInfo& info) {
+  // current_value() is null only if the variable was never initialised.
+  const auto current = [&info]<class T>() -> SettingValue {
+    cvar::ConfigVar<T>* typed = Typed<T>(info.var);
+    T* value = typed->current_value();
+    if constexpr (std::is_same_v<T, std::filesystem::path>) {
+      return SettingValue(xe::path_to_utf8(value ? *value : T()));
+    } else {
+      return SettingValue(value ? *value : typed->GetTypedConfigValue());
+    }
+  };
+  switch (info.type) {
+    case SettingType::kBool:
+      return current.operator()<bool>();
+    case SettingType::kInt32:
+      return current.operator()<int32_t>();
+    case SettingType::kUint32:
+      return current.operator()<uint32_t>();
+    case SettingType::kInt64:
+      return current.operator()<int64_t>();
+    case SettingType::kUint64:
+      return current.operator()<uint64_t>();
+    case SettingType::kDouble:
+      return current.operator()<double>();
+    case SettingType::kString:
+      return current.operator()<std::string>();
+    case SettingType::kPath:
+      return current.operator()<std::filesystem::path>();
+    default:
+      return SettingValue(std::string());
+  }
+}
+
+bool SettingsModel::IsModified(const SettingInfo& info) {
+  return info.var->config_value() != info.var->default_value_string();
+}
+
+bool SettingsModel::Apply(const SettingInfo& info, const SettingValue& value) {
+  switch (info.type) {
+    case SettingType::kBool:
+      if (const bool* v = std::get_if<bool>(&value)) {
+        Typed<bool>(info.var)->OverrideConfigValue(*v);
+        return true;
+      }
+      return false;
+    case SettingType::kInt32:
+      if (const int32_t* v = std::get_if<int32_t>(&value)) {
+        Typed<int32_t>(info.var)->OverrideConfigValue(*v);
+        return true;
+      }
+      return false;
+    case SettingType::kUint32:
+      if (const uint32_t* v = std::get_if<uint32_t>(&value)) {
+        Typed<uint32_t>(info.var)->OverrideConfigValue(*v);
+        return true;
+      }
+      return false;
+    case SettingType::kInt64:
+      if (const int64_t* v = std::get_if<int64_t>(&value)) {
+        Typed<int64_t>(info.var)->OverrideConfigValue(*v);
+        return true;
+      }
+      return false;
+    case SettingType::kUint64:
+      if (const uint64_t* v = std::get_if<uint64_t>(&value)) {
+        Typed<uint64_t>(info.var)->OverrideConfigValue(*v);
+        return true;
+      }
+      return false;
+    case SettingType::kDouble:
+      if (const double* v = std::get_if<double>(&value)) {
+        Typed<double>(info.var)->OverrideConfigValue(*v);
+        return true;
+      }
+      return false;
+    case SettingType::kString:
+      if (const std::string* v = std::get_if<std::string>(&value)) {
+        Typed<std::string>(info.var)->OverrideConfigValue(*v);
+        return true;
+      }
+      return false;
+    case SettingType::kPath:
+      if (const std::string* v = std::get_if<std::string>(&value)) {
+        Typed<std::filesystem::path>(info.var)->OverrideConfigValue(
+            xe::to_path(*v));
+        return true;
+      }
+      return false;
+    default:
+      return false;
+  }
+}
+
+void SettingsModel::ResetToDefault(const SettingInfo& info) {
+  // ResetConfigValueToDefault() leaves command line / game overrides in place;
+  // applying the default explicitly makes the reset visible immediately.
+  Apply(info, GetDefault(info));
+}
+
+bool SettingsModel::SaveGlobal() {
+  if (config::GetConfigFolder().empty()) {
+    return false;
+  }
+  config::SaveConfig();
+  return true;
+}
+
+std::string SettingsModel::Format(const SettingValue& value) {
+  return std::visit(
+      [](const auto& v) -> std::string {
+        using V = std::decay_t<decltype(v)>;
+        if constexpr (std::is_same_v<V, bool>) {
+          return v ? "true" : "false";
+        } else if constexpr (std::is_same_v<V, std::string>) {
+          return v;
+        } else {
+          return fmt::format("{}", v);
+        }
+      },
+      value);
+}
+
+GameOverrides::GameOverrides(uint32_t title_id)
+    : title_id_(title_id),
+      file_path_(config::GetGameConfigPath(fmt::format("{:08X}", title_id))) {}
+
+bool GameOverrides::Load() {
+  root_ = toml::table();
+  error_.clear();
+  parse_failed_ = false;
+
+  std::error_code ec;
+  if (!std::filesystem::exists(file_path_, ec)) {
+    return true;
+  }
+  try {
+    root_ = ParseFile(file_path_);
+  } catch (const std::exception& e) {
+    root_ = toml::table();
+    parse_failed_ = true;
+    error_ = e.what();
+    XELOGE("Cannot parse game config {}: {}", xe::path_to_utf8(file_path_),
+           error_);
+    return false;
+  }
+  return true;
+}
+
+bool GameOverrides::Has(const SettingInfo& info) const {
+  return FindNode(root_, info) != nullptr;
+}
+
+bool GameOverrides::Get(const SettingInfo& info,
+                        SettingValue* out_value) const {
+  const toml::node* node = FindNode(root_, info);
+  if (!node) {
+    return false;
+  }
+  SettingValue value;
+  switch (info.type) {
+    case SettingType::kBool: {
+      const auto v = node->value<bool>();
+      if (!v) return false;
+      value = *v;
+    } break;
+    case SettingType::kInt32: {
+      const auto v = node->value<int64_t>();
+      if (!v || *v < std::numeric_limits<int32_t>::min() ||
+          *v > std::numeric_limits<int32_t>::max()) {
+        return false;
+      }
+      value = static_cast<int32_t>(*v);
+    } break;
+    case SettingType::kUint32: {
+      const auto v = node->value<int64_t>();
+      if (!v || *v < 0 || *v > std::numeric_limits<uint32_t>::max()) {
+        return false;
+      }
+      value = static_cast<uint32_t>(*v);
+    } break;
+    case SettingType::kInt64: {
+      const auto v = node->value<int64_t>();
+      if (!v) return false;
+      value = *v;
+    } break;
+    case SettingType::kUint64: {
+      const auto v = node->value<int64_t>();
+      if (!v || *v < 0) return false;
+      value = static_cast<uint64_t>(*v);
+    } break;
+    case SettingType::kDouble: {
+      const auto v = node->value<double>();
+      if (!v) return false;
+      value = *v;
+    } break;
+    case SettingType::kString:
+    case SettingType::kPath: {
+      const auto v = node->value<std::string>();
+      if (!v) return false;
+      value = *v;
+    } break;
+    default:
+      return false;
+  }
+  if (out_value) {
+    *out_value = std::move(value);
+  }
+  return true;
+}
+
+void GameOverrides::Set(const SettingInfo& info, const SettingValue& value) {
+  toml::table* parent = FindParentTable(root_, info, true);
+  if (!parent) {
+    return;
+  }
+  std::visit(
+      [&](const auto& v) {
+        using V = std::decay_t<decltype(v)>;
+        if constexpr (std::is_same_v<V, bool> || std::is_same_v<V, double> ||
+                      std::is_same_v<V, std::string>) {
+          parent->insert_or_assign(info.name, v);
+        } else if constexpr (std::is_same_v<V, uint64_t>) {
+          // TOML integers are signed 64-bit.
+          parent->insert_or_assign(
+              info.name, static_cast<int64_t>(std::min<uint64_t>(
+                             v, std::numeric_limits<int64_t>::max())));
+        } else {
+          parent->insert_or_assign(info.name, static_cast<int64_t>(v));
+        }
+      },
+      value);
+}
+
+void GameOverrides::Remove(const SettingInfo& info) {
+  EraseAndPrune(root_, SplitCategory(info.category), 0, info.name);
+}
+
+size_t GameOverrides::count() const { return CountLeaves(root_); }
+
+bool GameOverrides::Save() {
+  if (parse_failed_) {
+    // Never overwrite a file we could not understand.
+    return false;
+  }
+  std::error_code ec;
+  if (count() == 0) {
+    if (std::filesystem::exists(file_path_, ec)) {
+      std::filesystem::remove(file_path_, ec);
+    }
+    return !ec;
+  }
+
+  xe::filesystem::CreateParentFolder(file_path_);
+  std::filesystem::path temporary = file_path_;
+  temporary += ".tmp";
+  {
+    std::ofstream file(temporary, std::ofstream::trunc);
+    if (!file.is_open()) {
+      return false;
+    }
+    file << "# Per-game overrides, edited from Xenia's settings window.\n";
+    file << root_ << "\n";
+    if (!file.good()) {
+      return false;
+    }
+  }
+  std::filesystem::rename(temporary, file_path_, ec);
+  return !ec;
+}
+
+}  // namespace app
+}  // namespace xe
