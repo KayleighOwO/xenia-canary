@@ -51,6 +51,9 @@ class IConfigVar : virtual public ICommandVar {
   virtual const std::string& category() const = 0;
   virtual bool is_transient() const = 0;
   virtual std::string config_value() const = 0;
+  // The compiled-in default, formatted exactly like config_value(), so the two
+  // can be compared to tell whether the user has changed the variable.
+  virtual std::string default_value_string() const = 0;
   virtual void LoadConfigValue(const toml::node* result) = 0;
   virtual void LoadGameConfigValue(const toml::node* result) = 0;
   virtual void ResetConfigValueToDefault() = 0;
@@ -86,7 +89,9 @@ class ConfigVar : public CommandVar<T>, virtual public IConfigVar {
   ConfigVar<T>(const char* name, T* default_value, const char* description,
                const char* category, bool is_transient);
   std::string config_value() const override;
+  std::string default_value_string() const override;
   const T& GetTypedConfigValue() const;
+  const T& GetTypedDefaultValue() const;
   const std::string& category() const override;
   bool is_transient() const override;
   void AddToLaunchOptions(cxxopts::Options* options) override;
@@ -280,8 +285,16 @@ std::string ConfigVar<T>::config_value() const {
   return this->ToString(this->default_value_);
 }
 template <class T>
+std::string ConfigVar<T>::default_value_string() const {
+  return this->ToString(this->default_value_);
+}
+template <class T>
 const T& ConfigVar<T>::GetTypedConfigValue() const {
   return config_value_ ? *config_value_ : this->default_value_;
+}
+template <class T>
+const T& ConfigVar<T>::GetTypedDefaultValue() const {
+  return this->default_value_;
 }
 template <class T>
 void CommandVar<T>::SetCommandLineValue(const T val) {
