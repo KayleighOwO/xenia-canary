@@ -305,10 +305,14 @@ void SetupConfig(const std::filesystem::path& config_folder) {
   }
 }
 
+const std::filesystem::path& GetConfigFolder() { return config_folder; }
+
+std::filesystem::path GetGameConfigPath(const std::string_view title_id) {
+  return config_folder / "config" / (std::string(title_id) + game_config_suffix);
+}
+
 void LoadGameConfig(const std::string_view title_id) {
-  const auto game_config_folder = config_folder / "config";
-  const auto game_config_path =
-      game_config_folder / (std::string(title_id) + game_config_suffix);
+  const auto game_config_path = GetGameConfigPath(title_id);
   if (std::filesystem::exists(game_config_path)) {
     ReadGameConfig(game_config_path);
   }
