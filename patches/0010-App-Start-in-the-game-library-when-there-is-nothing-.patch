@@ -1,0 +1,55 @@
+From a637af84ad7b432f76f9ff273d5879726d7dad51 Mon Sep 17 00:00:00 2001
+From: Xenia UI <ui@example.invalid>
+Date: Sun, 4 Oct 2026 01:48:22 +0000
+Subject: [PATCH 10/10] [App] Start in the game library when there is nothing
+ to launch
+
+When Xenia starts without a target (and no chained title to run) it now opens
+the library instead of an empty window. Controlled by the new
+library_show_on_startup option (on by default; also in the Settings window).
+---
+ src/xenia/app/xenia_main.cc | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/xenia/app/xenia_main.cc b/src/xenia/app/xenia_main.cc
+index 9777dc6e1..3967e7c26 100644
+--- a/src/xenia/app/xenia_main.cc
++++ b/src/xenia/app/xenia_main.cc
+@@ -115,6 +115,7 @@ DEFINE_bool(mount_memory_unit, false, "Enable memory unit (MU) mount",
+             "Storage");
+ 
+ DECLARE_bool(force_mount_devkit);
++DECLARE_bool(library_show_on_startup);
+ 
+ DEFINE_transient_path(target, "",
+                       "Specifies the target .xex or .iso to execute.",
+@@ -765,10 +766,12 @@ void EmulatorApp::EmulatorThread() {
+   auto xam = emulator_->kernel_state()->GetKernelModule<kernel::xam::XamModule>(
+       "xam.xex");
+ 
++  bool launching_loader_target = false;
+   if (xam) {
+     xam->LoadLoaderData();
+ 
+     if (!xam->loader_data().host_path.empty()) {
++      launching_loader_target = true;
+       const std::filesystem::path host_path = xam->loader_data().host_path;
+       app_context().CallInUIThread([this, host_path]() {
+         return emulator_window_->RunTitle(host_path);
+@@ -776,6 +779,13 @@ void EmulatorApp::EmulatorThread() {
+     }
+   }
+ 
++  // Nothing to run: start in the game library.
++  if (path.empty() && !launching_loader_target &&
++      cvars::library_show_on_startup) {
++    app_context().CallInUIThread(
++        [this]() { emulator_window_->ShowLibraryDialog(); });
++  }
++
+   // Now, we're going to use this thread to drive events related to emulation.
+   while (!emulator_thread_quit_requested_.load(std::memory_order_relaxed)) {
+     xe::threading::Wait(emulator_thread_event_.get(), false);
+-- 
+2.43.0
+
