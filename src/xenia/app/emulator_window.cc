@@ -1044,6 +1044,12 @@ void EmulatorWindow::OnKeyDown(ui::KeyEvent& e) {
     return;
   }
 
+  // Typing into a text field (e.g. in an ImGui dialog) must not also trigger
+  // hotkeys such as the numpad CPU time scalar keys.
+  if (imgui_drawer_ && imgui_drawer_->GetIO().WantTextInput) {
+    return;
+  }
+
   switch (e.virtual_key()) {
     case ui::VirtualKey::kO: {
       if (!e.is_ctrl_pressed()) {
