@@ -151,7 +151,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
       const std::filesystem::path& cache_root, uint32_t title_id, bool blocking,
       std::function<void()> completion_callback = nullptr) override;
 
-  void RestoreEdramSnapshot(const void* snapshot) override;
+  void RestoreEdramSnapshot(const void* snapshot, size_t size_bytes) override;
 
   void PollCompletedSubmission() override;
 
@@ -200,6 +200,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
       uint32_t src_queue_family_index = VK_QUEUE_FAMILY_IGNORED,
       uint32_t dst_queue_family_index = VK_QUEUE_FAMILY_IGNORED,
       bool skip_if_equal = true);
+  // sample_locations has to stay valid until barriers are submitted.
   bool PushImageMemoryBarrier(
       VkImage image, const VkImageSubresourceRange& subresource_range,
       VkPipelineStageFlags src_stage_mask, VkPipelineStageFlags dst_stage_mask,
@@ -207,7 +208,8 @@ class VulkanCommandProcessor final : public CommandProcessor {
       VkImageLayout old_layout, VkImageLayout new_layout,
       uint32_t src_queue_family_index = VK_QUEUE_FAMILY_IGNORED,
       uint32_t dst_queue_family_index = VK_QUEUE_FAMILY_IGNORED,
-      bool skip_if_equal = true);
+      bool skip_if_equal = true,
+      const VkSampleLocationsInfoEXT* sample_locations = nullptr);
   // Returns whether any barriers have been submitted - if true is returned, the
   // render pass will also be closed.
   bool SubmitBarriers(bool force_end_render_pass);
@@ -500,14 +502,16 @@ class VulkanCommandProcessor final : public CommandProcessor {
                           reg::RB_DEPTHCONTROL normalized_depth_control,
                           uint32_t draw_resolution_scale_x,
                           uint32_t draw_resolution_scale_y,
-                          bool depth_bias_in_pixel_shader);
+                          bool depth_bias_in_pixel_shader,
+                          bool window_offset_in_edram);
   void UpdateSystemConstantValues(
       bool primitive_polygonal,
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
       bool shader_32bit_index_dma, const draw_util::ViewportInfo& viewport_info,
       uint32_t used_texture_mask, reg::RB_DEPTHCONTROL normalized_depth_control,
       uint32_t normalized_color_mask,
-      const draw_util::HostDepthPolygonOffset* host_depth_polygon_offset);
+      const draw_util::HostDepthPolygonOffset* host_depth_polygon_offset,
+      int32_t window_offset_tiles);
   bool UpdateBindings(const VulkanShader* vertex_shader,
                       const VulkanShader* pixel_shader);
   // Allocates a descriptor set and fills one or two VkWriteDescriptorSet

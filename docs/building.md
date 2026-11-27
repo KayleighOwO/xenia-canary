@@ -37,6 +37,9 @@ xb premake
 
 # Format code to the style guide:
 xb format
+
+# Build and run the unit tests:
+xb test
 ```
 <!--
 # Remove intermediate files and build outputs (doesn't work on Linux):
@@ -91,8 +94,13 @@ get helpful spacers/movs in the disassembly.
 
 Linux support is extremely experimental and presently incomplete.
 
-The build script uses Clang 19. GCC while it should work in theory, is not easily
-interchangeable right now.
+The build script uses Clang 19 or newer, and CI builds with Clang 20. GCC while
+it should work in theory, is not easily interchangeable right now.
+
+Clang builds against the system's GCC C++ standard library (libstdc++), which
+must support C++20 `<format>`. That needs libstdc++ from GCC 13 or newer, so
+distributions with an older default GCC, such as Debian 12 or Ubuntu 22.04,
+can't build Xenia with their default toolchain. CI builds on Ubuntu 24.04.
 
 * Normal building via `xb build` uses CMake+Ninja.
 * Environment variables:
@@ -108,8 +116,13 @@ Clang-19 or newer should be available from system repositories on all up to date
 You will also need some development libraries. To get them on an Ubuntu system:
 
 ```sh
-sudo apt-get install build-essential mesa-vulkan-drivers valgrind libc++-dev libc++abi-dev libgtk-3-dev liblz4-dev libsdl2-dev libvulkan-dev libx11-xcb-dev clang-19 llvm-19 ninja-build
+sudo apt-get install build-essential mesa-vulkan-drivers valgrind libc++-dev libc++abi-dev libgtk-3-dev liblz4-dev libudev-dev libasound2-dev libpulse-dev libpipewire-0.3-dev libvulkan-dev libx11-xcb-dev clang-19 llvm-19 ninja-build
 ```
+
+SDL3 is taken from the system when it is installed (`libsdl3-dev`, Ubuntu 25.04
+or newer), and built from `third_party/SDL3` otherwise. That build needs the
+ALSA, PulseAudio and PipeWire development packages above for sound, and
+`libudev-dev` for controller hotplug.
 
 In addition, you will need up to date Vulkan libraries and drivers for your hardware, which most distributions have in their standard repositories nowadays.
 

@@ -760,7 +760,8 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
   }
 
   // Texel center snap instead of the epsilon, see CanSnapToTexelCenter.
-  bool point_snap = instr.CanSnapToTexelCenter(use_computed_lod);
+  bool point_snap =
+      cvars::texture_point_snap && instr.CanSnapToTexelCenter(use_computed_lod);
 
   // Get offsets applied to the coordinates before sampling.
   // `offsets` is used for float4 literal construction,
@@ -1366,10 +1367,20 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
                     dxbc::Src::LI(1));
           a_.OpUToF(dxbc::Dest::R(coord_and_sampler_temp, 0b1000),
                     dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kWWWW));
-          // linear_x = coord.x * original_width (stored in coord.y temporarily)
-          a_.OpMul(dxbc::Dest::R(coord_and_sampler_temp, 0b0010),
-                   dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kXXXX),
-                   dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kWWWW));
+          // linear_x = original coordinate in texels + offset (stored in
+          // coord.y). Use the original coordinate, avoiding the normalization
+          // round trip that can round a coordinate at a texel boundary into the
+          // previous texel.
+          if (instr.attributes.unnormalized_coordinates) {
+            a_.OpAdd(dxbc::Dest::R(coord_and_sampler_temp, 0b0010),
+                     coord_operand.SelectFromSwizzled(0),
+                     dxbc::Src::LF(offsets[0]));
+          } else {
+            a_.OpMAd(dxbc::Dest::R(coord_and_sampler_temp, 0b0010),
+                     coord_operand.SelectFromSwizzled(0),
+                     dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kWWWW),
+                     dxbc::Src::LF(offsets[0]));
+          }
           // row_width = 8192.0f (constant)
           // scaled = linear_x / row_width (stored in coord.z temporarily)
           a_.OpDiv(dxbc::Dest::R(coord_and_sampler_temp, 0b0100),
@@ -2400,7 +2411,7 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
                dxbc::Src::LU(UINT32_C(1) << 24));
       a_.OpIf(true, dxbc::Src::R(signs_temp, dxbc::Src::kXXXX));
       if (instr.AllowsPointSampling(use_computed_lod)) {
-        // Reconstruct point sampled 4 to 7 bit unsigned components
+        // Reconstruct point sampled 4 to 6 bit unsigned components
         // using the guest conversion (see GetIntegerScaleBits).
         a_.OpAnd(dxbc::Dest::R(signs_temp, 0b0001), integer_scale_bits_packed,
                  dxbc::Src::LU((UINT32_C(1) << 24) - 1));

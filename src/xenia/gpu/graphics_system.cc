@@ -9,12 +9,15 @@
 
 #include "xenia/gpu/graphics_system.h"
 
+#include <charconv>
+
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/profiling.h"
 #include "xenia/base/threading.h"
+#include "xenia/base/utf8.h"
 #include "xenia/config.h"
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/gpu_flags.h"
@@ -59,6 +62,17 @@ GraphicsSystem::GraphicsSystem() : frame_limiter_worker_running_(false) {
 
 GraphicsSystem::~GraphicsSystem() = default;
 
+// The trace writer is compiled out of Release unless XENIA_ENABLE_GPU_TRACE is
+// enabled.
+constexpr bool kTraceCaptureAvailable =
+    XE_ENABLE_TRACE_WRITER_INSTRUMENTATION != 0;
+
+static void WarnTraceCaptureUnavailable() {
+  XELOGW(
+      "GPU trace capture isn't built into this configuration; use a Debug "
+      "build or enable the XENIA_ENABLE_GPU_TRACE CMake option");
+}
+
 X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
                                kernel::KernelState* kernel_state,
                                ui::WindowedAppContext* app_context,
@@ -88,11 +102,42 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
             OnHostGpuLossFromAnyThread(is_responsible);
           });
     }
+
+    if (presenter_) {
+      presenter_->SetFrameRateSource([this]() { return GetFramesPerSecond(); });
+    }
   }
 
   // Create command processor. This will spin up a thread to process all
   // incoming ringbuffer packets.
   command_processor_ = CreateCommandProcessor();
+
+  // Trace requests from the command line, made before Initialize starts the
+  // command processor thread, which reads the frame numbers on every swap.
+  if (cvars::trace_gpu_stream) {
+    BeginTracing();
+  }
+  std::vector<uint32_t> trace_frame_numbers;
+  for (std::string_view frame :
+       utf8::split(cvars::trace_gpu_frames, ", ", true)) {
+    uint32_t frame_number;
+    auto [end, error] = std::from_chars(
+        frame.data(), frame.data() + frame.size(), frame_number);
+    if (error != std::errc() || end != frame.data() + frame.size()) {
+      XELOGW("Ignoring invalid frame number \"{}\" in trace_gpu_frames", frame);
+      continue;
+    }
+    trace_frame_numbers.push_back(frame_number);
+  }
+  if (!trace_frame_numbers.empty()) {
+    if constexpr (kTraceCaptureAvailable) {
+      command_processor_->SetTraceFrameNumbers(cvars::trace_gpu_prefix,
+                                               std::move(trace_frame_numbers));
+    } else {
+      WarnTraceCaptureUnavailable();
+    }
+  }
+
   if (!command_processor_->Initialize()) {
     XELOGE("Unable to initialize command processor");
     return X_STATUS_UNSUCCESSFUL;
@@ -143,6 +188,8 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
 #endif
 
             while (frame_limiter_worker_running_) {
+              ClearStaleFrameRate();
+
               // If there is no title running then there is no need for guest
               // frame limiter thread.
               if (!kernel_state_->is_title_open()) {
@@ -255,9 +302,6 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
   frame_limiter_worker_thread_->thread()->set_priority(
       threading::ThreadPriority::kNormal);
 #endif
-  if (cvars::trace_gpu_stream) {
-    BeginTracing();
-  }
 
   return X_STATUS_SUCCESS;
 }
@@ -271,7 +315,8 @@ void GraphicsSystem::Shutdown() {
 
   if (frame_limiter_worker_thread_) {
     frame_limiter_worker_running_ = false;
-    frame_limiter_worker_thread_->Wait(0, 0, 0, nullptr);
+    frame_limiter_worker_thread_->Wait(0, kernel::X_KPROCESSOR_MODE::KernelMode,
+                                       0, nullptr);
     frame_limiter_worker_thread_.reset();
   }
 
@@ -327,6 +372,8 @@ uint32_t GraphicsSystem::ReadRegister(uint32_t addr) {
       return 0x08100748;
     case 0x0F01:  // RB_BC_CONTROL
       return 0x0000200E;
+    case 0x0F2D:  // RB_HSIO_INTERFACE_ALIGNER_VALUE
+      return 0x00BBBBBB;
     case 0x1951:  // interrupt status
       return 1;   // vblank
     case 0x1961:  // AVIVO_D1MODE_VIEWPORT_SIZE
@@ -349,6 +396,10 @@ void GraphicsSystem::WriteRegister(uint32_t addr, uint32_t value) {
   switch (r) {
     case 0x01C5:  // CP_RB_WPTR
       command_processor_->UpdateWritePointer(value);
+      break;
+    case 0x0F01:  // RB_BC_CONTROL
+      break;
+    case 0x0F2D:  // RB_HSIO_INTERFACE_ALIGNER_VALUE
       break;
     case 0x1844:  // AVIVO_D1GRPH_PRIMARY_SURFACE_ADDRESS
       break;
@@ -394,6 +445,79 @@ void GraphicsSystem::MarkVblank() {
   DispatchInterruptCallback(0, 2);
 }
 
+void GraphicsSystem::OnGuestSwap() {
+  const uint64_t now = Clock::QueryHostTickCount();
+
+  if (!frame_rate_tick_frequency_) {
+    frame_rate_tick_frequency_ =
+        std::max<uint64_t>(Clock::QueryHostTickFrequency(), 1);
+  }
+
+  frame_rate_last_swap_ticks_.store(now, std::memory_order_relaxed);
+
+  const uint64_t previous_swap_ticks = frame_rate_previous_swap_ticks_;
+  frame_rate_previous_swap_ticks_ = now;
+
+  // First swap, or first after a stall: restart the period.
+  if (!previous_swap_ticks ||
+      now - previous_swap_ticks >=
+          frame_rate_tick_frequency_ * kFrameRateStallMs / 1000) {
+    frame_rate_period_start_ticks_ = now;
+    frame_rate_period_swaps_ = 0;
+    return;
+  }
+
+  ++frame_rate_period_swaps_;
+
+  const uint64_t elapsed_ticks = now - frame_rate_period_start_ticks_;
+  if (elapsed_ticks < frame_rate_tick_frequency_ * kFrameRatePeriodMs / 1000) {
+    return;
+  }
+
+  PublishFrameRate(float(double(frame_rate_period_swaps_) *
+                         double(frame_rate_tick_frequency_) /
+                         double(elapsed_ticks)));
+
+  frame_rate_period_start_ticks_ = now;
+  frame_rate_period_swaps_ = 0;
+}
+
+void GraphicsSystem::SetFrameRateCallback(std::function<void()> callback) {
+  std::lock_guard<std::mutex> lock(frame_rate_mutex_);
+  frame_rate_callback_ = std::move(callback);
+}
+
+void GraphicsSystem::PublishFrameRate(float frames_per_second) {
+  std::lock_guard<std::mutex> lock(frame_rate_mutex_);
+
+  frame_rate_frames_per_second_.store(frames_per_second,
+                                      std::memory_order_relaxed);
+
+  if (frame_rate_callback_) {
+    frame_rate_callback_();
+  }
+}
+
+void GraphicsSystem::ClearStaleFrameRate() {
+  if (frame_rate_frames_per_second_.load(std::memory_order_relaxed) == 0.0f) {
+    return;
+  }
+
+  if (kernel_state_->is_title_open()) {
+    const uint64_t last_swap_ticks =
+        frame_rate_last_swap_ticks_.load(std::memory_order_relaxed);
+    const uint64_t now = Clock::QueryHostTickCount();
+    const uint64_t stall_ticks =
+        Clock::QueryHostTickFrequency() * kFrameRateStallMs / 1000;
+
+    if (now < last_swap_ticks || now - last_swap_ticks < stall_ticks) {
+      return;
+    }
+  }
+
+  PublishFrameRate(0.0f);
+}
+
 void GraphicsSystem::ClearCaches() {
   command_processor_->CallInThread(
       [&]() { command_processor_->ClearCaches(); });
@@ -436,11 +560,19 @@ void GraphicsSystem::InitializeShaderStorage(
 }
 
 void GraphicsSystem::RequestFrameTrace() {
-  command_processor_->RequestFrameTrace(cvars::trace_gpu_prefix);
+  if constexpr (kTraceCaptureAvailable) {
+    command_processor_->RequestFrameTrace(cvars::trace_gpu_prefix);
+  } else {
+    WarnTraceCaptureUnavailable();
+  }
 }
 
 void GraphicsSystem::BeginTracing() {
-  command_processor_->BeginTracing(cvars::trace_gpu_prefix);
+  if constexpr (kTraceCaptureAvailable) {
+    command_processor_->BeginTracing(cvars::trace_gpu_prefix);
+  } else {
+    WarnTraceCaptureUnavailable();
+  }
 }
 
 void GraphicsSystem::EndTracing() { command_processor_->EndTracing(); }

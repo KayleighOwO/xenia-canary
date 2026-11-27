@@ -22,6 +22,7 @@
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
+#include "xenia/base/memory.h"
 #include "xenia/base/profiling.h"
 #include "xenia/base/string.h"
 #include "xenia/base/string_buffer.h"
@@ -103,6 +104,7 @@ PipelineCache::PipelineCache(D3D12CommandProcessor& command_processor,
       render_target_cache_.msaa_2x_supported(),
       render_target_cache_.draw_resolution_scale_x(),
       render_target_cache_.draw_resolution_scale_y(),
+      render_target_cache_.edram_tile_count(),
       provider.GetGraphicsAnalysis() != nullptr);
 
   depth_only_pixel_shader_ =
@@ -261,7 +263,8 @@ void PipelineCache::InitializeShaderStorage(
   pipeline_config.file_suffix = fmt::format(
       ".{}{}.d3d12.xpso", edram_rov_used ? "rov" : "rtv",
       edram_rov_used && cvars::occlusion_query_full_counters ? "-fc" : "");
-  pipeline_config.api_magic = edram_rov_used ? 0x4F525844 : 0x54525844;
+  pipeline_config.api_magic =
+      edram_rov_used ? make_fourcc_le("DXRO") : make_fourcc_le("DXRT");
   pipeline_config.version =
       std::max(PipelineDescription::kVersion,
                DxbcShaderTranslator::Modification::kVersion);
@@ -452,6 +455,7 @@ void PipelineCache::InitializeShaderStorage(
       COUNT_profile_set("gpu/pipeline_cache/pipelines", pipelines_.size());
       if (!creation_threads_.empty()) {
         // Submit the pipeline for creation to any available thread.
+        new_pipeline->creation_pending.store(true, std::memory_order_release);
         {
           std::lock_guard<xe_mutex> lock(creation_request_lock_);
           creation_queue_.push(new_pipeline);
@@ -909,6 +913,8 @@ bool PipelineCache::ConfigurePipeline(
           bound_rts, pixel_shader->shader().writes_color_targets(),
           pixel_shader->shader().writes_depth());
     }
+
+    new_pipeline->creation_pending.store(true, std::memory_order_release);
     {
       std::lock_guard<xe_mutex> lock(creation_request_lock_);
       creation_queue_.push(new_pipeline);
@@ -1169,6 +1175,7 @@ void PipelineCache::TranslateShadersForStorage(
         render_target_cache_.msaa_2x_supported(),
         render_target_cache_.draw_resolution_scale_x(),
         render_target_cache_.draw_resolution_scale_y(),
+        render_target_cache_.edram_tile_count(),
         provider.GetGraphicsAnalysis() != nullptr);
     // DXIL conversion objects.
     IDxbcConverter* dxbc_converter = nullptr;
@@ -3124,10 +3131,8 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
   uint32_t msaa_sample_count = uint32_t(1)
                                << uint32_t(description.host_msaa_samples);
   if (edram_rov_used) {
-    // Only 1, 4, 8 and (not on all GPUs) 16 are allowed, using sample 0 as 0
-    // and 3 as 1 for 2x instead (not exactly the same sample positions, but
-    // still top-left and bottom-right - however, this can be adjusted with
-    // programmable sample positions).
+    // Only 1, 4, 8 and (not on all GPUs) 16 are allowed, using samples 2 and
+    // 1 as 0 and 1 for 2x instead (see GetHostSampleXenosPositions).
     assert_true(msaa_sample_count == 1 || msaa_sample_count == 4);
     if (msaa_sample_count != 1 && msaa_sample_count != 4) {
       return nullptr;
@@ -3147,9 +3152,7 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
       return nullptr;
     }
     if (msaa_sample_count == 2 && !render_target_cache_.msaa_2x_supported()) {
-      // Using sample 0 as 0 and 3 as 1 for 2x instead (not exactly the same
-      // sample positions, but still top-left and bottom-right - however, this
-      // can be adjusted with programmable sample positions).
+      // Using sample 0 as 0 and 3 as 1 for 2x instead.
       state_desc.SampleMask = 0b1001;
       state_desc.SampleDesc.Count = 4;
     } else {
@@ -3351,6 +3354,7 @@ void PipelineCache::CreationThread(size_t thread_index) {
       render_target_cache_.msaa_2x_supported(),
       render_target_cache_.draw_resolution_scale_x(),
       render_target_cache_.draw_resolution_scale_y(),
+      render_target_cache_.edram_tile_count(),
       provider.GetGraphicsAnalysis() != nullptr);
   // Create thread-local DXIL conversion objects if needed.
   IDxbcConverter* dxbc_converter = nullptr;
@@ -3441,6 +3445,9 @@ void PipelineCache::CreationThread(size_t thread_index) {
                  : 0);
     }
 
+    pipeline_to_create->creation_pending.store(false,
+                                               std::memory_order_release);
+
     // Pipeline created - the thread is not busy anymore, safe to set the
     // completion event if needed (at the next iteration, or in some other
     // thread).
@@ -3480,6 +3487,9 @@ void PipelineCache::CreateQueuedPipelinesOnProcessorThread() {
     } else {
       XELOGW("ProcessorThread: Pipeline creation failed");
     }
+
+    pipeline_to_create->creation_pending.store(false,
+                                               std::memory_order_release);
   }
 }
 

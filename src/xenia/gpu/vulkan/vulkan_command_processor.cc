@@ -9,8 +9,10 @@
 
 #include "xenia/gpu/vulkan/vulkan_command_processor.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <thread>
 
 #include "xenia/apu/audio_system.h"
 #include "xenia/base/assert.h"
@@ -38,6 +40,14 @@
 
 DECLARE_bool(clear_memory_page_state);
 DECLARE_bool(readback_resolve_half_pixel_offset);
+
+DEFINE_bool(vulkan_depth_bias_force_unorm, true,
+            "Apply the depth bias in constant units on float depth buffers "
+            "where VK_EXT_depth_bias_control supports it, so the bias keeps "
+            "its absolute size at every depth. Otherwise, the bias unit of a "
+            "float depth buffer shrinks with the depth, and decals may "
+            "Z-fight, especially with reversed depth.",
+            "Vulkan");
 
 namespace xe {
 namespace gpu {
@@ -120,7 +130,8 @@ void VulkanCommandProcessor::InitializeShaderStorage(
                                            std::move(completion_callback));
 }
 
-void VulkanCommandProcessor::RestoreEdramSnapshot(const void* snapshot) {}
+void VulkanCommandProcessor::RestoreEdramSnapshot(const void* snapshot,
+                                                  size_t size_bytes) {}
 
 std::string VulkanCommandProcessor::GetWindowTitleText() const {
   std::ostringstream title;
@@ -1870,7 +1881,7 @@ bool VulkanCommandProcessor::PushImageMemoryBarrier(
     VkAccessFlags src_access_mask, VkAccessFlags dst_access_mask,
     VkImageLayout old_layout, VkImageLayout new_layout,
     uint32_t src_queue_family_index, uint32_t dst_queue_family_index,
-    bool skip_if_equal) {
+    bool skip_if_equal, const VkSampleLocationsInfoEXT* sample_locations) {
   if (skip_if_equal && src_stage_mask == dst_stage_mask &&
       src_access_mask == dst_access_mask && old_layout == new_layout &&
       src_queue_family_index == dst_queue_family_index) {
@@ -1902,7 +1913,8 @@ bool VulkanCommandProcessor::PushImageMemoryBarrier(
              subresource_range.baseArrayLayer)) {
       continue;
     }
-    if (other_image_memory_barrier.subresourceRange.aspectMask ==
+    if (other_image_memory_barrier.pNext == sample_locations &&
+        other_image_memory_barrier.subresourceRange.aspectMask ==
             subresource_range.aspectMask &&
         other_image_memory_barrier.subresourceRange.baseMipLevel ==
             subresource_range.baseMipLevel &&
@@ -1934,7 +1946,7 @@ bool VulkanCommandProcessor::PushImageMemoryBarrier(
   VkImageMemoryBarrier& image_memory_barrier =
       pending_barriers_image_memory_barriers_.emplace_back();
   image_memory_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-  image_memory_barrier.pNext = nullptr;
+  image_memory_barrier.pNext = sample_locations;
   image_memory_barrier.srcAccessMask = src_access_mask;
   image_memory_barrier.dstAccessMask = dst_access_mask;
   image_memory_barrier.oldLayout = old_layout;
@@ -2019,8 +2031,15 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
   render_pass_begin_info.renderArea.extent = framebuffer->host_extent;
   render_pass_begin_info.clearValueCount = 0;
   render_pass_begin_info.pClearValues = nullptr;
-  deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
-                                                VK_SUBPASS_CONTENTS_INLINE);
+  // The sample locations for automatic depth layout transitions and for the
+  // subpass rasterization state when variableSampleLocations is false.
+  deferred_command_buffer_.CmdVkBeginRenderPass(
+      &render_pass_begin_info, VK_SUBPASS_CONTENTS_INLINE,
+      framebuffer->render_pass_key.depth_and_color_used
+          ? render_target_cache_->GetSampleLocationsInfo(
+                framebuffer->render_pass_key.msaa_samples, true)
+          : nullptr,
+      (framebuffer->render_pass_key.depth_and_color_used & 1) != 0);
 
   // Resume any pending ZPD segment now that the pass is open.
   OpenQuerySegment(false);
@@ -2663,23 +2682,28 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
     CheckSubmissionCompletionAndDeviceLoss(sampler_overflow_await_submission);
   }
 
+  // Put the window offset into the EDRAM bases when possible.
+  int32_t window_offset_tiles = render_target_cache_->GetWindowOffsetTiles(
+      regs, normalized_depth_control, normalized_color_mask, frame_current_);
+
   // Set up the render targets - this may perform dispatches and draws.
-  if (!render_target_cache_->Update(is_rasterization_done,
-                                    normalized_depth_control,
-                                    normalized_color_mask, *vertex_shader)) {
+  if (!render_target_cache_->Update(
+          is_rasterization_done, normalized_depth_control,
+          normalized_color_mask, *vertex_shader, window_offset_tiles)) {
     return false;
   }
 
   // Create the pipeline (for this, need the render pass from the render target
   // cache), translating the shaders - doing this now to obtain the used
   // textures.
+  VulkanRenderTargetCache::RenderPassKey render_pass_key =
+      render_target_cache_->last_update_render_pass_key();
   VulkanPipelineCache::Pipeline* pipeline;
   if (!pipeline_cache_->ConfigurePipeline(
           vertex_shader_translation, pixel_shader_translation,
           primitive_processing_result, normalized_depth_control,
-          normalized_color_mask,
-          render_target_cache_->last_update_render_pass_key(), zpd_hybrid,
-          viz_survey, &pipeline)) {
+          normalized_color_mask, render_pass_key, zpd_hybrid, viz_survey,
+          &pipeline)) {
     return false;
   }
 
@@ -2694,6 +2718,17 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
       return false;
     }
   }
+
+  // A placeholder draw to a small target, or in place of a pixel shader with
+  // memexport, may never be redone, so wait for the real pipeline.
+  if (pipeline->is_placeholder.load(std::memory_order_acquire) &&
+      ((pixel_shader && pixel_shader->memexport_eM_written() != 0) ||
+       draw_util::IsAsyncPipelineWaitNeededForDraw(regs))) {
+    do {
+      std::this_thread::sleep_for(std::chrono::microseconds(100));
+    } while (pipeline->is_placeholder.load(std::memory_order_acquire));
+  }
+
   // If async mode is active, this may be a placeholder pipeline. The real
   // pipeline will be swapped in by the creation thread when ready.
   // We re-load the handle to pick up any swap that may have happened.
@@ -2806,14 +2841,19 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
       normalized_depth_control,
       host_render_targets_used &&
           render_target_cache_->depth_float24_convert_in_pixel_shader(),
-      host_render_targets_used, pixel_shader && pixel_shader->writes_depth());
-  gviargs.SetupRegisterValues(regs);
+      host_render_targets_used, pixel_shader && pixel_shader->writes_depth(),
+      !host_render_targets_used ||
+          render_target_cache_->GetSampleLocationsInfo(
+              render_pass_key.msaa_samples,
+              render_pass_key.depth_and_color_used) != nullptr);
+  gviargs.SetupRegisterValues(regs, window_offset_tiles != 0);
 
   draw_util::GetHostViewportInfo(&gviargs, viewport_info);
   // Update dynamic graphics pipeline state.
   UpdateDynamicState(viewport_info, primitive_polygonal,
                      normalized_depth_control, draw_resolution_scale_x,
-                     draw_resolution_scale_y, apply_host_depth_polygon_offset);
+                     draw_resolution_scale_y, apply_host_depth_polygon_offset,
+                     window_offset_tiles != 0);
 
   auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
 
@@ -2845,7 +2885,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
       primitive_polygonal, primitive_processing_result, shader_32bit_index_dma,
       viewport_info, used_texture_mask, normalized_depth_control,
       normalized_color_mask,
-      apply_host_depth_polygon_offset ? &host_depth_polygon_offset : nullptr);
+      apply_host_depth_polygon_offset ? &host_depth_polygon_offset : nullptr,
+      window_offset_tiles);
 
   // Update uniform buffers and descriptor sets after binding the pipeline with
   // the new layout.
@@ -2962,6 +3003,41 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
                  memexport_range_base_bytes + memexport_range.size_bytes);
   }
 
+  // Snapshot the export ranges before the draw so the readback after it only
+  // copies the bytes the shaders actually changed. Copying the whole range
+  // back would overwrite anything the CPU wrote there while the draw was in
+  // flight, since the ranges are usually much larger than what gets exported.
+  // The first half of the readback buffer holds the snapshot, the second half
+  // the result.
+  uint32_t memexport_total_size = 0;
+  bool memexport_snapshot_taken = false;
+  if (GetGPUSetting(GPUSetting::ReadbackMemexport)) {
+    for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+      memexport_total_size += memexport_range.size_bytes;
+    }
+    if (memexport_total_size != 0) {
+      VkBuffer readback_buffer =
+          RequestReadbackBuffer(memexport_total_size * 2);
+      if (readback_buffer != VK_NULL_HANDLE) {
+        shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+        SubmitBarriers(true);
+        VkBuffer shared_memory_buffer = shared_memory_->buffer();
+        uint32_t readback_buffer_offset = 0;
+        for (const draw_util::MemExportRange& memexport_range :
+             memexport_ranges_) {
+          VkBufferCopy copy_region = {};
+          copy_region.srcOffset = memexport_range.base_address_dwords << 2;
+          copy_region.dstOffset = readback_buffer_offset;
+          copy_region.size = memexport_range.size_bytes;
+          deferred_command_buffer_.CmdVkCopyBuffer(
+              shared_memory_buffer, readback_buffer, 1, &copy_region);
+          readback_buffer_offset += memexport_range.size_bytes;
+        }
+        memexport_snapshot_taken = true;
+      }
+    }
+  }
+
   // Insert the shared memory barrier if needed.
   // TODO(Triang3l): Find some PM4 command that can be used for indication of
   // when memexports should be awaited instead of inserting the barrier in Use
@@ -2991,7 +3067,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
         primitive_polygonal, primitive_processing_result,
         shader_32bit_index_dma, viewport_info, used_texture_mask,
         normalized_depth_control, normalized_color_mask,
-        apply_host_depth_polygon_offset ? &host_depth_polygon_offset : nullptr);
+        apply_host_depth_polygon_offset ? &host_depth_polygon_offset : nullptr,
+        window_offset_tiles);
     if (!UpdateBindings(vertex_shader, pixel_shader)) {
       return false;
     }
@@ -3055,75 +3132,75 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   }
 
   // CPU readback for memexport data (if enabled).
-  if (GetGPUSetting(GPUSetting::ReadbackMemexport) &&
-      !memexport_ranges_.empty()) {
-    // Calculate total size of all memexport ranges.
-    uint32_t memexport_total_size = 0;
-    for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
-      memexport_total_size += memexport_range.size_bytes;
-    }
+  if (memexport_snapshot_taken) {
+    VkBuffer readback_buffer = RequestReadbackBuffer(memexport_total_size * 2);
+    if (readback_buffer != VK_NULL_HANDLE) {
+      const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+      const ui::vulkan::VulkanDevice::Functions& dfn =
+          vulkan_device->functions();
+      const VkDevice device = vulkan_device->device();
 
-    if (memexport_total_size > 0) {
-      VkBuffer readback_buffer = RequestReadbackBuffer(memexport_total_size);
-      if (readback_buffer != VK_NULL_HANDLE) {
-        const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
-        const ui::vulkan::VulkanDevice::Functions& dfn =
-            vulkan_device->functions();
-        const VkDevice device = vulkan_device->device();
+      VkBuffer shared_memory_buffer = shared_memory_->buffer();
 
-        VkBuffer shared_memory_buffer = shared_memory_->buffer();
+      // Ensure shared memory is ready for transfer, outside the render pass.
+      shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+      SubmitBarriers(true);
 
-        // Ensure shared memory is ready for transfer.
-        shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+      // Copy each memexport range to the second half of the readback buffer.
+      uint32_t readback_buffer_offset = memexport_total_size;
+      for (const draw_util::MemExportRange& memexport_range :
+           memexport_ranges_) {
+        VkBufferCopy copy_region = {};
+        copy_region.srcOffset = memexport_range.base_address_dwords << 2;
+        copy_region.dstOffset = readback_buffer_offset;
+        copy_region.size = memexport_range.size_bytes;
 
-        // Copy each memexport range to the readback buffer.
-        uint32_t readback_buffer_offset = 0;
-        for (const draw_util::MemExportRange& memexport_range :
-             memexport_ranges_) {
-          VkBufferCopy copy_region = {};
-          copy_region.srcOffset = memexport_range.base_address_dwords << 2;
-          copy_region.dstOffset = readback_buffer_offset;
-          copy_region.size = memexport_range.size_bytes;
+        deferred_command_buffer_.CmdVkCopyBuffer(
+            shared_memory_buffer, readback_buffer, 1, &copy_region);
 
-          deferred_command_buffer_.CmdVkCopyBuffer(
-              shared_memory_buffer, readback_buffer, 1, &copy_region);
+        readback_buffer_offset += memexport_range.size_bytes;
+      }
 
-          readback_buffer_offset += memexport_range.size_bytes;
-        }
-
-        // Wait for GPU to finish (SYNCHRONIZATION STALL)
-        if (AwaitAllQueueOperationsCompletion()) {
-          // Map staging buffer and copy to guest memory.
-          void* mapped_data;
-          if (dfn.vkMapMemory(device, memexport_readback_buffer_memory_, 0,
-                              memexport_total_size, 0,
-                              &mapped_data) == VK_SUCCESS) {
-            if (mapped_data) {
-              const uint8_t* readback_bytes =
-                  static_cast<const uint8_t*>(mapped_data);
-              for (const draw_util::MemExportRange& memexport_range :
-                   memexport_ranges_) {
-                std::memcpy(memory_->TranslatePhysical(
-                                memexport_range.base_address_dwords << 2),
-                            readback_bytes, memexport_range.size_bytes);
-                readback_bytes += memexport_range.size_bytes;
+      // Wait for GPU to finish (SYNCHRONIZATION STALL)
+      if (AwaitAllQueueOperationsCompletion()) {
+        // Map staging buffer and copy to guest memory.
+        void* mapped_data;
+        if (dfn.vkMapMemory(device, memexport_readback_buffer_memory_, 0,
+                            VkDeviceSize(memexport_total_size) * 2, 0,
+                            &mapped_data) == VK_SUCCESS) {
+          if (mapped_data) {
+            // Compared per byte as exports of 8 and 16 bit formats give
+            // ranges that aren't a multiple of 4 bytes.
+            const uint8_t* before_bytes =
+                static_cast<const uint8_t*>(mapped_data);
+            const uint8_t* after_bytes = before_bytes + memexport_total_size;
+            for (const draw_util::MemExportRange& memexport_range :
+                 memexport_ranges_) {
+              uint8_t* guest_bytes = memory_->TranslatePhysical(
+                  memexport_range.base_address_dwords << 2);
+              for (uint32_t i = 0; i < memexport_range.size_bytes; ++i) {
+                if (after_bytes[i] != before_bytes[i]) {
+                  guest_bytes[i] = after_bytes[i];
+                }
               }
-            } else {
-              XELOGE(
-                  "VulkanCommandProcessor: Failed to map readback buffer "
-                  "(mapped_data is null)");
+              before_bytes += memexport_range.size_bytes;
+              after_bytes += memexport_range.size_bytes;
             }
-            dfn.vkUnmapMemory(device, memexport_readback_buffer_memory_);
           } else {
             XELOGE(
-                "VulkanCommandProcessor: Failed to map readback buffer memory "
-                "for memexport");
+                "VulkanCommandProcessor: Failed to map readback buffer "
+                "(mapped_data is null)");
           }
+          dfn.vkUnmapMemory(device, memexport_readback_buffer_memory_);
         } else {
           XELOGE(
-              "VulkanCommandProcessor: Failed to complete queue operations for "
-              "memexport readback");
+              "VulkanCommandProcessor: Failed to map readback buffer memory "
+              "for memexport");
         }
+      } else {
+        XELOGE(
+            "VulkanCommandProcessor: Failed to complete queue operations for "
+            "memexport readback");
       }
     }
   }
@@ -3541,6 +3618,7 @@ bool VulkanCommandProcessor::IssueCopy() {
                                                &downscale_copy_region);
     } else {
       shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+      SubmitBarriers(true);
 
       VkBufferCopy copy_region = {};
       copy_region.srcOffset = written_address;
@@ -4779,7 +4857,7 @@ void VulkanCommandProcessor::UpdateDynamicState(
     const draw_util::ViewportInfo& viewport_info, bool primitive_polygonal,
     reg::RB_DEPTHCONTROL normalized_depth_control,
     uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
-    bool depth_bias_in_pixel_shader) {
+    bool depth_bias_in_pixel_shader, bool window_offset_in_edram) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -4814,7 +4892,7 @@ void VulkanCommandProcessor::UpdateDynamicState(
 
   // Scissor.
   draw_util::Scissor scissor;
-  draw_util::GetScissor(regs, scissor);
+  draw_util::GetScissor(regs, scissor, true, window_offset_in_edram);
   // Scale the scissor to match the render target resolution scale
   scissor.offset[0] *= draw_resolution_scale_x;
   scissor.offset[1] *= draw_resolution_scale_y;
@@ -4830,6 +4908,13 @@ void VulkanCommandProcessor::UpdateDynamicState(
   if (render_target_cache_->GetPath() ==
       RenderTargetCache::Path::kHostRenderTargets) {
     // Depth bias.
+    const ui::vulkan::VulkanDevice::Properties& device_properties =
+        GetVulkanDevice()->properties();
+    const bool depth_bias_force_unorm =
+        cvars::vulkan_depth_bias_force_unorm &&
+        device_properties.depthBiasControl &&
+        device_properties.leastRepresentableValueForceUnormRepresentation &&
+        device_properties.depthBiasExact;
     float depth_bias_constant_factor, depth_bias_slope_factor;
     if (depth_bias_in_pixel_shader) {
       depth_bias_constant_factor = 0.0f;
@@ -4838,11 +4923,16 @@ void VulkanCommandProcessor::UpdateDynamicState(
       draw_util::GetPreferredFacePolygonOffset(regs, primitive_polygonal,
                                                depth_bias_slope_factor,
                                                depth_bias_constant_factor);
+      const bool depth_float24 = regs.Get<reg::RB_DEPTH_INFO>().depth_format ==
+                                 xenos::DepthRenderTargetFormat::kD24FS8;
       depth_bias_constant_factor *=
-          regs.Get<reg::RB_DEPTH_INFO>().depth_format ==
-                  xenos::DepthRenderTargetFormat::kD24S8
-              ? draw_util::kD3D10PolygonOffsetFactorUnorm24
-              : draw_util::kD3D10PolygonOffsetFactorFloat24;
+          depth_float24 ? draw_util::kD3D10PolygonOffsetFactorFloat24
+                        : draw_util::kD3D10PolygonOffsetFactorUnorm24;
+      if (depth_bias_force_unorm && depth_float24) {
+        // With a constant bias unit, the host 0...0.5 depth range no longer
+        // lowers the exponent (see kD3D10PolygonOffsetFactorFloat24).
+        depth_bias_constant_factor *= 0.5f;
+      }
       // With non-square resolution scaling, make sure the worst-case impact is
       // reverted (slope only along the scaled axis), thus max. More bias is
       // better than less bias, because less bias means Z fighting with the
@@ -4863,9 +4953,17 @@ void VulkanCommandProcessor::UpdateDynamicState(
     if (dynamic_depth_bias_update_needed_) {
       dynamic_depth_bias_constant_factor_ = depth_bias_constant_factor;
       dynamic_depth_bias_slope_factor_ = depth_bias_slope_factor;
-      deferred_command_buffer_.CmdVkSetDepthBias(
-          dynamic_depth_bias_constant_factor_, 0.0f,
-          dynamic_depth_bias_slope_factor_);
+      if (depth_bias_force_unorm) {
+        deferred_command_buffer_.CmdVkSetDepthBias2EXT(
+            dynamic_depth_bias_constant_factor_, 0.0f,
+            dynamic_depth_bias_slope_factor_,
+            VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT,
+            true);
+      } else {
+        deferred_command_buffer_.CmdVkSetDepthBias(
+            dynamic_depth_bias_constant_factor_, 0.0f,
+            dynamic_depth_bias_slope_factor_);
+      }
       dynamic_depth_bias_update_needed_ = false;
     }
 
@@ -5014,7 +5112,8 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
     bool shader_32bit_index_dma, const draw_util::ViewportInfo& viewport_info,
     uint32_t used_texture_mask, reg::RB_DEPTHCONTROL normalized_depth_control,
     uint32_t normalized_color_mask,
-    const draw_util::HostDepthPolygonOffset* host_depth_polygon_offset) {
+    const draw_util::HostDepthPolygonOffset* host_depth_polygon_offset,
+    int32_t window_offset_tiles) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -5068,7 +5167,8 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
                                normalized_depth_control.z_enable;
   if (edram_fragment_shader_interlock && depth_stencil_enabled) {
     for (uint32_t i = 0; i < 4; ++i) {
-      if (rb_depth_info.depth_base == color_infos[i].color_base &&
+      if (render_target_cache_->WrapEdramBase(rb_depth_info.depth_base) ==
+              render_target_cache_->WrapEdramBase(color_infos[i].color_base) &&
           RenderTargetCache::ColorOverlapsDepthStencil(
               color_infos[i].color_format, rt_keep_masks[i][0],
               rt_keep_masks[i][1], normalized_depth_control)) {
@@ -5227,6 +5327,19 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
     }
   }
 
+  // Window offset carried in the EDRAM bases.
+  float param_gen_window_offset[2] = {0.0f, 0.0f};
+  if (window_offset_tiles) {
+    auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+    param_gen_window_offset[0] = float(pa_sc_window_offset.window_x_offset);
+    param_gen_window_offset[1] = float(pa_sc_window_offset.window_y_offset);
+  }
+  for (uint32_t i = 0; i < 2; ++i) {
+    dirty |= system_constants_.param_gen_window_offset[i] !=
+             param_gen_window_offset[i];
+    system_constants_.param_gen_window_offset[i] = param_gen_window_offset[i];
+  }
+
   // Point size.
   if (vgt_draw_initiator.prim_type == xenos::PrimitiveType::kPointList) {
     auto pa_su_point_minmax = regs.Get<reg::PA_SU_POINT_MINMAX>();
@@ -5382,6 +5495,9 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
     reg::RB_COLOR_INFO color_info = color_infos[i];
     // Exponent bias is in bits 20:25 of RB_COLOR_INFO.
     int32_t color_exp_bias = color_info.color_exp_bias;
+    float color_exp_bias_scale;
+    *reinterpret_cast<int32_t*>(&color_exp_bias_scale) =
+        UINT32_C(0x3F800000) + (color_exp_bias << 23);
     if (render_target_cache_->GetPath() ==
             RenderTargetCache::Path::kHostRenderTargets &&
         (color_info.color_format == xenos::ColorRenderTargetFormat::k_16_16 &&
@@ -5389,13 +5505,11 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
          color_info.color_format ==
                  xenos::ColorRenderTargetFormat::k_16_16_16_16 &&
              !render_target_cache_->IsFixedRGBA16TruncatedToMinus1To1())) {
-      // Remap from -32...32 to -1...1 by dividing the output values by 32,
-      // losing blending correctness, but getting the full range.
-      color_exp_bias -= 5;
+      // Remap to -1...1 by scaling the output values by 1024/32767, losing
+      // blending correctness, but getting the full range apart from -32,
+      // which SNORM folds into -32767/1024.
+      color_exp_bias_scale *= 1024.0f / 32767.0f;
     }
-    float color_exp_bias_scale;
-    *reinterpret_cast<int32_t*>(&color_exp_bias_scale) =
-        UINT32_C(0x3F800000) + (color_exp_bias << 23);
     dirty |= system_constants_.color_exp_bias[i] != color_exp_bias_scale;
     system_constants_.color_exp_bias[i] = color_exp_bias_scale;
     if (edram_fragment_shader_interlock) {
@@ -5408,7 +5522,11 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
       if (rt_keep_masks[i][0] != UINT32_MAX ||
           rt_keep_masks[i][1] != UINT32_MAX) {
         uint32_t rt_base_dwords_scaled =
-            color_info.color_base * edram_tile_dwords_scaled;
+            draw_util::AddWindowOffsetToEdramBase(
+                color_info.color_base, window_offset_tiles,
+                xenos::IsColorRenderTargetFormat64bpp(color_info.color_format),
+                render_target_cache_->edram_tile_count()) *
+            edram_tile_dwords_scaled;
         dirty |= system_constants_.edram_rt_base_dwords_scaled[i] !=
                  rt_base_dwords_scaled;
         system_constants_.edram_rt_base_dwords_scaled[i] =
@@ -5458,7 +5576,10 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
 
   if (edram_fragment_shader_interlock) {
     uint32_t depth_base_dwords_scaled =
-        rb_depth_info.depth_base * edram_tile_dwords_scaled;
+        draw_util::AddWindowOffsetToEdramBase(
+            rb_depth_info.depth_base, window_offset_tiles, false,
+            render_target_cache_->edram_tile_count()) *
+        edram_tile_dwords_scaled;
     dirty |= system_constants_.edram_depth_base_dwords_scaled !=
              depth_base_dwords_scaled;
     system_constants_.edram_depth_base_dwords_scaled = depth_base_dwords_scaled;
