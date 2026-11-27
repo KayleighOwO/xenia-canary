@@ -33,6 +33,7 @@
 #include "xenia/gpu/draw_util.h"
 #include "xenia/gpu/dxbc_shader.h"
 #include "xenia/gpu/dxbc_shader_translator.h"
+#include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/registers.h"
 #include "xenia/gpu/xenos.h"
 #include "xenia/kernel/kernel_state.h"
@@ -77,7 +78,7 @@ class D3D12CommandProcessor final : public CommandProcessor {
 
   void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) override;
 
-  void RestoreEdramSnapshot(const void* snapshot) override;
+  void RestoreEdramSnapshot(const void* snapshot, size_t size_bytes) override;
 
   void PollCompletedSubmission() override;
 
@@ -218,6 +219,20 @@ class D3D12CommandProcessor final : public CommandProcessor {
   void SetScissorRect(const D3D12_RECT& scissor_rect);
   void SetStencilReference(uint32_t stencil_ref);
   void SetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY primitive_topology);
+
+  // Sets Xenos MSAA sample positions based on ForcedSampleCount for ROV, or
+  // target sample count, or the default pattern at 1x. Submits pending
+  // barriers under the old pattern first.
+  void UpdateSamplePositions(xenos::MsaaSamples msaa_samples);
+  bool xenos_sample_positions_used() const {
+    // ROV always uses Xenos' MSAA sample positions.
+    // xenos_sample_positions targets host RTs with programmable position
+    // support.
+    return xenos_sample_positions_supported_ &&
+           (render_target_cache_->GetPath() ==
+                RenderTargetCache::Path::kPixelShaderInterlock ||
+            cvars::xenos_sample_positions);
+  }
 
   // Returns the text to display in the GPU backend name in the window title.
   std::string GetWindowTitleText() const;
@@ -465,7 +480,8 @@ class D3D12CommandProcessor final : public CommandProcessor {
       xenos::Endian index_endian, const draw_util::ViewportInfo& viewport_info,
       uint32_t used_texture_mask, reg::RB_DEPTHCONTROL normalized_depth_control,
       uint32_t normalized_color_mask,
-      const draw_util::HostDepthPolygonOffset* host_depth_polygon_offset);
+      const draw_util::HostDepthPolygonOffset* host_depth_polygon_offset,
+      int32_t window_offset_tiles);
 
   void UpdateSystemConstantValues(
       bool shared_memory_is_uav, bool primitive_polygonal,
@@ -473,7 +489,8 @@ class D3D12CommandProcessor final : public CommandProcessor {
       const draw_util::ViewportInfo& viewport_info, uint32_t used_texture_mask,
       reg::RB_DEPTHCONTROL normalized_depth_control,
       uint32_t normalized_color_mask,
-      const draw_util::HostDepthPolygonOffset* host_depth_polygon_offset);
+      const draw_util::HostDepthPolygonOffset* host_depth_polygon_offset,
+      int32_t window_offset_tiles);
   bool UpdateBindings(const D3D12Shader* vertex_shader,
                       const D3D12Shader* pixel_shader,
                       ID3D12RootSignature* root_signature,
@@ -605,6 +622,10 @@ class D3D12CommandProcessor final : public CommandProcessor {
   // bindful - mainly because of CopyDescriptorsSimple, which takes the majority
   // of UpdateBindings time, and that's outside the emulator's control even).
   bool bindless_resources_used_ = false;
+
+  // SetSamplePositions and ResolveSubresourceRegion remove the device
+  // without tier 1 support.
+  bool xenos_sample_positions_supported_ = false;
 
   std::unique_ptr<D3D12SharedMemory> shared_memory_;
 
@@ -902,6 +923,9 @@ class D3D12CommandProcessor final : public CommandProcessor {
 
   // Current primitive topology.
   D3D_PRIMITIVE_TOPOLOGY primitive_topology_;
+
+  // MSAA mode the command list's sample positions are programmed for.
+  xenos::MsaaSamples current_sample_positions_;
 
   draw_util::GetViewportInfoArgs previous_viewport_info_args_;
   draw_util::ViewportInfo previous_viewport_info_;

@@ -320,6 +320,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // bit 26 = point sampled fetch constant
     // Zero means no conversion.
     uint32_t texture_integer_scale_bits[32];
+
+    // PA_SC_WINDOW_OFFSET the PsParamGen position needs added when the offset
+    // is carried in the EDRAM bases rather than the viewport.
+    // 0 when it's in the viewport.
+    float param_gen_window_offset[2];
+    uint32_t param_gen_window_offset_padding[2];
   };
 
   // Separate constant buffer for user clip planes
@@ -441,14 +447,16 @@ class SpirvShaderTranslator : public ShaderTranslator {
                         bool native_2x_msaa_no_attachments,
                         bool edram_fragment_shader_interlock,
                         uint32_t draw_resolution_scale_x = 1,
-                        uint32_t draw_resolution_scale_y = 1)
+                        uint32_t draw_resolution_scale_y = 1,
+                        uint32_t edram_tile_count = xenos::kEdramTileCount)
       : features_(features),
         native_2x_msaa_with_attachments_(native_2x_msaa_with_attachments),
         native_2x_msaa_no_attachments_(native_2x_msaa_no_attachments),
         edram_fragment_shader_interlock_(edram_fragment_shader_interlock),
         zpd_full_counters_(cvars::occlusion_query_full_counters),
         draw_resolution_scale_x_(draw_resolution_scale_x),
-        draw_resolution_scale_y_(draw_resolution_scale_y) {}
+        draw_resolution_scale_y_(draw_resolution_scale_y),
+        edram_tile_count_(edram_tile_count) {}
 
   uint64_t GetDefaultVertexShaderModification(
       uint32_t dynamic_addressable_register_count,
@@ -886,6 +894,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
   bool native_2x_msaa_no_attachments_;
   uint32_t draw_resolution_scale_x_;
   uint32_t draw_resolution_scale_y_;
+  uint32_t edram_tile_count_;
 
   // Scale of the draw being translated. All position-dependent paths use
   // these. Only fetch offset scaling uses draw_resolution_scale_x_/y_ directly.
@@ -1031,6 +1040,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantEdramRTClamp,
     kSystemConstantEdramBlendConstant,
     kSystemConstantTextureIntegerScaleBits,
+    kSystemConstantParamGenWindowOffset,
   };
   spv::Id uniform_system_constants_;
   spv::Id uniform_clip_plane_constants_;

@@ -9,6 +9,8 @@
 
 #include "xenia/gpu/command_processor.h"
 
+#include <algorithm>
+
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/clock.h"
@@ -238,7 +240,7 @@ void CommandProcessor::Shutdown() {
 
   worker_running_ = false;
   write_ptr_index_event_->Set();
-  worker_thread_->Wait(0, 0, 0, nullptr);
+  worker_thread_->Wait(0, kernel::X_KPROCESSOR_MODE::KernelMode, 0, nullptr);
   worker_thread_.reset();
 }
 
@@ -262,6 +264,14 @@ void CommandProcessor::RequestFrameTrace(
   }
   trace_state_ = TraceState::kSingleFrame;
   trace_frame_path_ = root_path;
+}
+
+void CommandProcessor::SetTraceFrameNumbers(
+    const std::filesystem::path& root_path,
+    std::vector<uint32_t> frame_numbers) {
+  assert_false(worker_running_);
+  trace_frame_path_ = root_path;
+  trace_frame_numbers_ = std::move(frame_numbers);
 }
 
 void CommandProcessor::BeginTracing(const std::filesystem::path& root_path) {
@@ -547,13 +557,7 @@ void CommandProcessor::LogRegisterSets(uint32_t base_register_index,
 #if XE_ENABLE_GPU_REG_WRITE_LOGGING == 1
   if (cvars::log_guest_driven_gpu_register_written_values &&
       logging::ShouldLog(LogLevel::Debug)) {
-    auto target = logging::internal::GetThreadBuffer();
-
-    auto target_ptr = target.first;
-
-    size_t total_size = 0;
-
-    size_t rem_size = target.second;
+    logging::LoggerBatch<LogLevel::Debug> logger{};
 
     for (uint32_t i = 0; i < n_values; ++i) {
       uint32_t register_index = base_register_index + i;
@@ -564,22 +568,12 @@ void CommandProcessor::LogRegisterSets(uint32_t base_register_index,
           RegisterFile::GetRegisterInfo(register_index);
 
       if (!reginfo) {
-        auto tmpres = fmt::format_to_n(target_ptr, rem_size,
-                                       "Unknown_Reg{:04X} <- {:08X}\n",
-                                       register_index, value);
-        target_ptr = tmpres.out;
-        rem_size -= tmpres.size;
-        total_size += tmpres.size;
-
+        logger("Unknown_Reg{:04X} <- {:08X}\n", register_index, value);
       } else {
-        auto tmpres = fmt::format_to_n(target_ptr, rem_size, "{} <- {:08X}\n",
-                                       reginfo->name, value);
-        rem_size -= tmpres.size;
-        target_ptr = tmpres.out;
-        total_size += tmpres.size;
+        logger("{} <- {:08X}\n", reginfo->name, value);
       }
     }
-    logging::internal::AppendLogLine(LogLevel::Debug, 'd', total_size);
+    logger.submit('d');
   }
 #endif
 }

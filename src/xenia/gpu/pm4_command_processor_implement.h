@@ -459,6 +459,8 @@ bool COMMAND_PROCESSOR::ExecutePacketType3(uint32_t packet) XE_RESTRICT {
             COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE(packet, count);
         break;
       case PM4_EVENT_WRITE_SHD:
+      // Cache flush done event. Same initiator/address/value layout as SHD.
+      case PM4_EVENT_WRITE_CFL:
         result = COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_SHD(packet,
                                                                        count);
         break;
@@ -552,6 +554,13 @@ bool COMMAND_PROCESSOR::ExecutePacketType3(uint32_t packet) XE_RESTRICT {
         result = true;
         break;
       }
+      case PM4_WAIT_IB_PFD_COMPLETE: {
+        // Waits for earlier INDIRECT_BUFFER_PFD base and size writes.
+        // No wait is needed since we process indirect buffers synchronously.
+        reader_.AdvanceRead(count * sizeof(uint32_t));
+        result = true;
+        break;
+      }
       case PM4_WAIT_FOR_IDLE: {
         // This opcode is used by 5454084E while going / being ingame.
         assert_true(count == 1);
@@ -577,11 +586,26 @@ bool COMMAND_PROCESSOR::ExecutePacketType3(uint32_t packet) XE_RESTRICT {
           trace_state_ = TraceState::kDisabled;
           trace_writer_.Close();
         }
-      } else if (trace_state_ == TraceState::kSingleFrame) {
+      }
+      // A frame requested with SetTraceFrameNumbers, numbered by the swaps
+      // before it. This is checked after closing the previous trace so
+      // consecutive frames can be captured.
+      ++trace_swap_count_;
+      bool frame_requested =
+          trace_state_ == TraceState::kDisabled &&
+          std::find(trace_frame_numbers_.cbegin(), trace_frame_numbers_.cend(),
+                    trace_swap_count_) != trace_frame_numbers_.cend();
+      if (frame_requested) {
+        trace_state_ = TraceState::kSingleFrame;
+      }
+      if (!trace_writer_.is_open() &&
+          trace_state_ == TraceState::kSingleFrame) {
         // New trace request - we only start tracing at the beginning of a
         // frame.
         uint32_t title_id = kernel_state_->GetExecutableModule()->title_id();
-        auto file_name = fmt::format("{:08X}_{}.xtr", title_id, counter_ - 1);
+        auto file_name =
+            fmt::format("{:08X}_{}.xtr", title_id,
+                        frame_requested ? trace_swap_count_ : counter_ - 1);
         auto path = trace_frame_path_ / file_name;
         trace_writer_.Open(path, title_id);
         InitializeTrace();
@@ -662,6 +686,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_XE_SWAP(uint32_t packet,
 
   COMMAND_PROCESSOR::IssueSwap(frontbuffer_ptr, frontbuffer_width,
                                frontbuffer_height);
+  graphics_system_->OnGuestSwap();
 
   ++counter_;
   return true;

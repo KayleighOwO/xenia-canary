@@ -23,10 +23,11 @@ namespace xam {
 #pragma pack(push, 4)
 struct X_XAMACCOUNTINFO {
   enum AccountReservedFlags {
+    kVersionMask = 0x000000FF,
     kPasswordProtected = 0x10000000,
     kLiveEnabled = 0x20000000,
     kRecovering = 0x40000000,
-    kVersionMask = 0x000000FF
+    KPartialProfile = 0x80000000
   };
 
   enum AccountUserFlags {
@@ -348,11 +349,6 @@ enum class UserContextDevice : uint32_t {
   Microphone = 4,
 };
 
-enum class WriteTileType {
-  Tile = 1,  // Public
-  Personal = 2,
-};
-
 constexpr uint32_t XMP_MAX_METADATA_STRING = 40;
 constexpr uint32_t XMP_MAX_USER_PLAYLIST_ID = 572;
 constexpr uint32_t XMP_USER_PLAYLIST_RESERVED_FIELD_SIZE = 168;
@@ -372,6 +368,8 @@ struct X_STATS_DETAILS {
   xe::be<uint16_t> stats[kStatsMaxAmount];
 };
 static_assert_size(X_STATS_DETAILS, 8 + kStatsMaxAmount * 2);
+
+constexpr uint32_t MAX_LAUNCH_DATA_SIZE = 0x3FC;
 
 enum LoaderLaunchFlags : uint32_t {
   GetSystemVersion = 0x00000040,  // XamUpdateGetCurrentSystemVersion
