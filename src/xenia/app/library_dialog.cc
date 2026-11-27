@@ -98,7 +98,10 @@ void DrawStar(ImDrawList* draw_list, ImVec2 center, float radius, ImU32 color,
                                    color);
     }
   } else {
-    draw_list->AddPolyline(points, 10, color, ImDrawFlags_Closed, 1.5f);
+    // Not AddPolyline(): its argument order changed in ImGui 1.92.8.
+    for (int i = 0; i < 10; ++i) {
+      draw_list->AddLine(points[i], points[(i + 1) % 10], color, 1.5f);
+    }
   }
 }
 
@@ -522,9 +525,9 @@ void LibraryDialog::DrawTopBar() {
   const float available = ImGui::GetContentRegionAvail().x;
 
   ImGui::AlignTextToFramePadding();
-  ImGui::PushFont(imgui_drawer()->GetTitleFont());
+  launcher::PushTitleFont();
   ImGui::TextUnformatted("Library");
-  ImGui::PopFont();
+  launcher::PopTitleFont();
   ImGui::SameLine(0.0f, 20.0f * s);
 
   if (focus_search_) {
@@ -722,9 +725,9 @@ void LibraryDialog::DrawEmptyState() {
 
   const bool no_games_at_all = games_.empty();
   if (no_games_at_all && folders_.empty()) {
-    ImGui::PushFont(imgui_drawer()->GetTitleFont());
+    launcher::PushTitleFont();
     CenteredText("Add your games", region_width);
-    ImGui::PopFont();
+    launcher::PopTitleFont();
     ImGui::Spacing();
     CenteredText("Choose a folder that contains your games and Xenia", region_width);
     CenteredText("will find them. Supported: .iso, .zar and extracted", region_width);
@@ -750,9 +753,9 @@ void LibraryDialog::DrawEmptyState() {
     CenteredText(FitText(status, region_width - 40.0f * s).c_str(), region_width);
     ImGui::PopStyleColor();
   } else if (no_games_at_all) {
-    ImGui::PushFont(imgui_drawer()->GetTitleFont());
+    launcher::PushTitleFont();
     CenteredText("No games found", region_width);
-    ImGui::PopFont();
+    launcher::PopTitleFont();
     ImGui::Spacing();
     CenteredText("Nothing in your folders looks like a game.", region_width);
     CenteredText("Looking for .iso, .zar and extracted default.xex files.", region_width);
@@ -1030,11 +1033,11 @@ void LibraryDialog::DrawDetails(float width, float height) {
     ImGui::Dummy(ImVec2(icon_size, icon_size));
   }
   ImGui::Spacing();
-  ImGui::PushFont(imgui_drawer()->GetTitleFont());
+  launcher::PushTitleFont();
   ImGui::PushTextWrapPos(0.0f);
   ImGui::TextUnformatted(name.c_str());
   ImGui::PopTextWrapPos();
-  ImGui::PopFont();
+  launcher::PopTitleFont();
   ImGui::Spacing();
 
   float label_column = 0.0f;

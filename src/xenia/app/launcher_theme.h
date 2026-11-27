@@ -106,6 +106,26 @@ inline bool AccentButton(const char* label, const ImVec2& size = ImVec2(0, 0)) {
   return pressed;
 }
 
+// Larger text for headings.
+//
+// Xenia used to hand out a dedicated title font; ImGui 1.92 removed fixed-size
+// fonts (PushFont() takes a size) and the drawer no longer has one, so this
+// just draws the current font bigger. Works on both sides of that change.
+inline void PushTitleFont() {
+#if IMGUI_VERSION_NUM >= 19200
+  ImGui::PushFont(nullptr, ImGui::GetFontSize() * 1.35f);  // nullptr: same font
+#else
+  ImGui::SetWindowFontScale(1.35f);
+#endif
+}
+inline void PopTitleFont() {
+#if IMGUI_VERSION_NUM >= 19200
+  ImGui::PopFont();
+#else
+  ImGui::SetWindowFontScale(1.0f);
+#endif
+}
+
 // Tooltip that wraps long text at a readable width.
 inline void WrappedTooltip(const char* text) {
   ImGui::BeginTooltip();

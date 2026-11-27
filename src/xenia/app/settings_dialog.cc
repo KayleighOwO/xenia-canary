@@ -711,9 +711,9 @@ void SettingsDialog::OnDraw(ImGuiIO& io) {
 void SettingsDialog::DrawHeader() {
   const float s = launcher::UiScale();
   ImGui::AlignTextToFramePadding();
-  ImGui::PushFont(imgui_drawer()->GetTitleFont());
+  launcher::PushTitleFont();
   ImGui::TextUnformatted(game_mode_ ? "Game settings" : "Settings");
-  ImGui::PopFont();
+  launcher::PopTitleFont();
   if (game_mode_) {
     ImGui::SameLine(0.0f, 16.0f * s);
     ImGui::AlignTextToFramePadding();
