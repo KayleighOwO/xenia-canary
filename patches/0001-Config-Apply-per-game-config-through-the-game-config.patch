@@ -1,0 +1,34 @@
+From afdec9f7b29e7ec8050f5183dafee4e520294091 Mon Sep 17 00:00:00 2001
+From: Xenia UI <ui@example.invalid>
+Date: Sat, 3 Oct 2026 01:58:06 +0000
+Subject: [PATCH 01/10] [Config] Apply per-game config through the game-config
+ slot
+
+ReadGameConfig() loaded per-game values with LoadConfigValue(), which writes
+the *global* config slot. Those values were then persisted into the global
+config by SaveConfig() on exit, so playing a game with a per-game config
+silently rewrote the user's global settings.
+
+ConfigVar already has a dedicated game_config_value_ slot (priority above the
+global config, below the command line) and LoadGameConfigValue() to fill it,
+but nothing called it. Use it.
+---
+ src/xenia/config.cc | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/xenia/config.cc b/src/xenia/config.cc
+index cb6b80b9a..86305099b 100644
+--- a/src/xenia/config.cc
++++ b/src/xenia/config.cc
+@@ -160,7 +160,7 @@ void ReadGameConfig(const std::filesystem::path& file_path) {
+ 
+     const auto config_key_node = config.at_path(config_key);
+     if (config_key_node) {
+-      config_var->LoadConfigValue(config_key_node.node());
++      config_var->LoadGameConfigValue(config_key_node.node());
+     }
+   }
+   XELOGI("Loaded game config: {}", file_path);
+-- 
+2.43.0
+
