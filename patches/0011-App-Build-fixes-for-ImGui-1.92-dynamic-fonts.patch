@@ -1,0 +1,138 @@
+From 9076afbc6645ff3fa33aee63d0f2d1bb40fc30ef Mon Sep 17 00:00:00 2001
+From: Xenia UI <ui@example.invalid>
+Date: Fri, 27 Nov 2026 20:17:30 +0000
+Subject: [PATCH] [App] Build fixes for ImGui 1.92+ (dynamic fonts)
+
+* The headings used ImGuiDrawer::GetTitleFont(), which does not exist in
+  every tree, and ImGui::PushFont(font) which takes a size since 1.92. Add
+  launcher::PushTitleFont()/PopTitleFont() that draw the current font bigger
+  and work on both sides of that change (PushFont(nullptr, size) from 1.92,
+  SetWindowFontScale before).
+* ImDrawList::AddPolyline() swapped its thickness and flags arguments in
+  ImGui 1.92.8 and the old order is deleted when obsolete functions are
+  disabled. The favourite star outline is now drawn with AddLine(), whose
+  signature never changed.
+
+No behaviour change otherwise.
+---
+ src/xenia/app/launcher_theme.h   | 20 ++++++++++++++++++++
+ src/xenia/app/library_dialog.cc  | 21 ++++++++++++---------
+ src/xenia/app/settings_dialog.cc |  4 ++--
+ 3 files changed, 34 insertions(+), 11 deletions(-)
+
+diff --git a/src/xenia/app/launcher_theme.h b/src/xenia/app/launcher_theme.h
+index f623f2b03..03a9b57e3 100644
+--- a/src/xenia/app/launcher_theme.h
++++ b/src/xenia/app/launcher_theme.h
+@@ -106,6 +106,26 @@ inline bool AccentButton(const char* label, const ImVec2& size = ImVec2(0, 0)) {
+   return pressed;
+ }
+ 
++// Larger text for headings.
++//
++// Xenia used to hand out a dedicated title font; ImGui 1.92 removed fixed-size
++// fonts (PushFont() takes a size) and the drawer no longer has one, so this
++// just draws the current font bigger. Works on both sides of that change.
++inline void PushTitleFont() {
++#if IMGUI_VERSION_NUM >= 19200
++  ImGui::PushFont(nullptr, ImGui::GetFontSize() * 1.35f);  // nullptr: same font
++#else
++  ImGui::SetWindowFontScale(1.35f);
++#endif
++}
++inline void PopTitleFont() {
++#if IMGUI_VERSION_NUM >= 19200
++  ImGui::PopFont();
++#else
++  ImGui::SetWindowFontScale(1.0f);
++#endif
++}
++
+ // Tooltip that wraps long text at a readable width.
+ inline void WrappedTooltip(const char* text) {
+   ImGui::BeginTooltip();
+diff --git a/src/xenia/app/library_dialog.cc b/src/xenia/app/library_dialog.cc
+index f63e8fb02..af936177a 100644
+--- a/src/xenia/app/library_dialog.cc
++++ b/src/xenia/app/library_dialog.cc
+@@ -98,7 +98,10 @@ void DrawStar(ImDrawList* draw_list, ImVec2 center, float radius, ImU32 color,
+                                    color);
+     }
+   } else {
+-    draw_list->AddPolyline(points, 10, color, ImDrawFlags_Closed, 1.5f);
++    // Not AddPolyline(): its argument order changed in ImGui 1.92.8.
++    for (int i = 0; i < 10; ++i) {
++      draw_list->AddLine(points[i], points[(i + 1) % 10], color, 1.5f);
++    }
+   }
+ }
+ 
+@@ -522,9 +525,9 @@ void LibraryDialog::DrawTopBar() {
+   const float available = ImGui::GetContentRegionAvail().x;
+ 
+   ImGui::AlignTextToFramePadding();
+-  ImGui::PushFont(imgui_drawer()->GetTitleFont());
++  launcher::PushTitleFont();
+   ImGui::TextUnformatted("Library");
+-  ImGui::PopFont();
++  launcher::PopTitleFont();
+   ImGui::SameLine(0.0f, 20.0f * s);
+ 
+   if (focus_search_) {
+@@ -722,9 +725,9 @@ void LibraryDialog::DrawEmptyState() {
+ 
+   const bool no_games_at_all = games_.empty();
+   if (no_games_at_all && folders_.empty()) {
+-    ImGui::PushFont(imgui_drawer()->GetTitleFont());
++    launcher::PushTitleFont();
+     CenteredText("Add your games", region_width);
+-    ImGui::PopFont();
++    launcher::PopTitleFont();
+     ImGui::Spacing();
+     CenteredText("Choose a folder that contains your games and Xenia", region_width);
+     CenteredText("will find them. Supported: .iso, .zar and extracted", region_width);
+@@ -750,9 +753,9 @@ void LibraryDialog::DrawEmptyState() {
+     CenteredText(FitText(status, region_width - 40.0f * s).c_str(), region_width);
+     ImGui::PopStyleColor();
+   } else if (no_games_at_all) {
+-    ImGui::PushFont(imgui_drawer()->GetTitleFont());
++    launcher::PushTitleFont();
+     CenteredText("No games found", region_width);
+-    ImGui::PopFont();
++    launcher::PopTitleFont();
+     ImGui::Spacing();
+     CenteredText("Nothing in your folders looks like a game.", region_width);
+     CenteredText("Looking for .iso, .zar and extracted default.xex files.", region_width);
+@@ -1030,11 +1033,11 @@ void LibraryDialog::DrawDetails(float width, float height) {
+     ImGui::Dummy(ImVec2(icon_size, icon_size));
+   }
+   ImGui::Spacing();
+-  ImGui::PushFont(imgui_drawer()->GetTitleFont());
++  launcher::PushTitleFont();
+   ImGui::PushTextWrapPos(0.0f);
+   ImGui::TextUnformatted(name.c_str());
+   ImGui::PopTextWrapPos();
+-  ImGui::PopFont();
++  launcher::PopTitleFont();
+   ImGui::Spacing();
+ 
+   float label_column = 0.0f;
+diff --git a/src/xenia/app/settings_dialog.cc b/src/xenia/app/settings_dialog.cc
+index 15660ff0b..3c58bf97d 100644
+--- a/src/xenia/app/settings_dialog.cc
++++ b/src/xenia/app/settings_dialog.cc
+@@ -711,9 +711,9 @@ void SettingsDialog::OnDraw(ImGuiIO& io) {
+ void SettingsDialog::DrawHeader() {
+   const float s = launcher::UiScale();
+   ImGui::AlignTextToFramePadding();
+-  ImGui::PushFont(imgui_drawer()->GetTitleFont());
++  launcher::PushTitleFont();
+   ImGui::TextUnformatted(game_mode_ ? "Game settings" : "Settings");
+-  ImGui::PopFont();
++  launcher::PopTitleFont();
+   if (game_mode_) {
+     ImGui::SameLine(0.0f, 16.0f * s);
+     ImGui::AlignTextToFramePadding();
+-- 
+2.43.0
+

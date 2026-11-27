@@ -31,6 +31,10 @@ namespace app {
 
 class ConsoleSettingsDialog;
 class ContentListDialog;
+class GameLibrary;
+class LibraryDialog;
+class LibraryIconCache;
+class SettingsDialog;
 
 struct RecentTitleEntry {
   std::string title_name;
@@ -99,6 +103,18 @@ class EmulatorWindow {
   void ToggleXMPConfigDialog();
   void ToggleConsoleSettingsDialog();
   void ToggleContentListDialog();
+
+  // The game library: the launcher shown while no title is running.
+  GameLibrary& game_library() { return *game_library_; }
+  // Does nothing while a title is running.
+  void ShowLibraryDialog();
+  void ToggleLibraryDialog();
+  // Visual editor for the emulator configuration.
+  void OpenSettingsDialog();
+  // Visual editor for the per-game configuration of one title.
+  void OpenGameSettingsDialog(uint32_t title_id, std::string title_name);
+  // Shows the native "open file" dialog (outside of any ImGui draw call).
+  void PromptToOpenFile();
 
   void SetHotkeysState(bool enabled) { disable_hotkeys_ = !enabled; }
 
@@ -296,6 +312,9 @@ class EmulatorWindow {
                                 std::string title_name);
 
   void ClearDialogs();
+  // Brings the library back after a launch failed and dialogs were cleared.
+  void RestoreLibraryDialog();
+  void RecordLibraryLaunch(const std::filesystem::path& path);
 
   void OnFrameRateUpdated();
   void ToggleFrameRateOverlay();
@@ -316,6 +335,11 @@ class EmulatorWindow {
   std::string base_title_;
   bool initializing_shader_storage_ = false;
 
+  // The library and its icons are used by the dialogs below, so they have to
+  // be declared (and thus destroyed) around them.
+  std::unique_ptr<GameLibrary> game_library_;
+  std::unique_ptr<LibraryIconCache> library_icons_;
+  bool library_scanned_ = false;
   std::atomic<bool> frame_rate_update_pending_ = false;
 
   std::unique_ptr<DisplayConfigDialog> display_config_dialog_;
@@ -326,6 +350,9 @@ class EmulatorWindow {
   std::unique_ptr<ProfileConfigDialog> profile_config_dialog_;
 
   std::unique_ptr<XMPConfigDialog> xmp_config_dialog_;
+
+  std::unique_ptr<LibraryDialog> library_dialog_;
+  std::unique_ptr<SettingsDialog> settings_dialog_;
 
   std::vector<RecentTitleEntry> recently_launched_titles_;
 };

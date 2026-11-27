@@ -1,0 +1,1165 @@
+/**
+ ******************************************************************************
+ * Xenia : Xbox 360 Emulator Research Project                                 *
+ ******************************************************************************
+ * Copyright 2026 Xenia Canary. All rights reserved.                          *
+ * Released under the BSD license - see LICENSE in the root for more details. *
+ ******************************************************************************
+ */
+
+#include "xenia/app/library_dialog.h"
+
+#include <algorithm>
+#include <cctype>
+#include <cfloat>
+#include <cmath>
+#include <cstdio>
+#include <ctime>
+#include <fstream>
+#include <iterator>
+#include <utility>
+
+#include "third_party/fmt/include/fmt/format.h"
+#include "third_party/imgui/imgui.h"
+#include "xenia/app/emulator_window.h"
+#include "xenia/app/launcher_format.h"
+#include "xenia/app/launcher_theme.h"
+#include "xenia/app/settings_model.h"
+#include "xenia/base/cvar.h"
+#include "xenia/base/filesystem.h"
+#include "xenia/base/system.h"
+#include "xenia/ui/file_picker.h"
+#include "xenia/ui/immediate_drawer.h"
+
+DEFINE_bool(library_show_on_startup, true,
+            "Show the game library when Xenia starts without a game to "
+            "launch.",
+            "Library");
+DEFINE_string(library_view, "grid",
+              "Game library layout. Use: [grid, list]", "Library");
+DEFINE_string(library_sort, "name",
+              "Game library sort order. Use: [name, recent, played, size, "
+              "titleid]",
+              "Library");
+DEFINE_int32(library_card_size, 150,
+             "Width of a game card in the library grid, in pixels at the "
+             "default font size (100-260).",
+             "Library");
+
+namespace xe {
+namespace app {
+
+namespace {
+
+constexpr float kPi = 3.14159265358979f;
+constexpr int kMinCardSize = 100;
+constexpr int kMaxCardSize = 260;
+constexpr int kMaxIconLoadsPerFrame = 3;
+constexpr size_t kMaxIconFileSize = 4 * 1024 * 1024;
+
+uint32_t HashString(const std::string& text) {
+  uint32_t hash = 2166136261u;  // FNV-1a
+  for (unsigned char c : text) {
+    hash = (hash ^ c) * 16777619u;
+  }
+  return hash;
+}
+
+ImU32 PlaceholderColor(const std::string& name) {
+  const float hue = static_cast<float>(HashString(name) % 360u) / 360.0f;
+  return ImColor::HSV(hue, 0.40f, 0.40f);
+}
+
+char PlaceholderLetter(const std::string& name) {
+  for (unsigned char c : name) {
+    if (c < 0x80 && std::isalnum(c)) {
+      return static_cast<char>(std::toupper(c));
+    }
+    if (c >= 0x80) {
+      return '?';
+    }
+  }
+  return '#';
+}
+
+// A star is concave, so it's drawn as a fan of triangles around its center.
+void DrawStar(ImDrawList* draw_list, ImVec2 center, float radius, ImU32 color,
+              bool filled) {
+  ImVec2 points[10];
+  for (int i = 0; i < 10; ++i) {
+    const float angle = -kPi * 0.5f + static_cast<float>(i) * kPi / 5.0f;
+    const float r = (i % 2 == 0) ? radius : radius * 0.45f;
+    points[i] =
+        ImVec2(center.x + std::cos(angle) * r, center.y + std::sin(angle) * r);
+  }
+  if (filled) {
+    for (int i = 0; i < 10; ++i) {
+      draw_list->AddTriangleFilled(center, points[i], points[(i + 1) % 10],
+                                   color);
+    }
+  } else {
+    // Not AddPolyline(): its argument order changed in ImGui 1.92.8.
+    for (int i = 0; i < 10; ++i) {
+      draw_list->AddLine(points[i], points[(i + 1) % 10], color, 1.5f);
+    }
+  }
+}
+
+// Shortens text with "..." so it fits into max_width pixels.
+std::string FitText(const std::string& text, float max_width) {
+  if (ImGui::CalcTextSize(text.c_str()).x <= max_width) {
+    return text;
+  }
+  const float dots_width = ImGui::CalcTextSize("...").x;
+  size_t end = text.size();
+  while (end > 0) {
+    --end;
+    while (end > 0 && (static_cast<unsigned char>(text[end]) & 0xC0) == 0x80) {
+      --end;
+    }
+    if (ImGui::CalcTextSize(text.c_str(), text.c_str() + end).x + dots_width <=
+        max_width) {
+      break;
+    }
+  }
+  return text.substr(0, end) + "...";
+}
+
+void CenteredText(const char* text, float region_width) {
+  const float width = ImGui::CalcTextSize(text).x;
+  ImGui::SetCursorPosX(std::max(0.0f, (region_width - width) * 0.5f));
+  ImGui::TextUnformatted(text);
+}
+
+const char* FormatName(GameFormat format) {
+  switch (format) {
+    case GameFormat::kDiscImage:
+      return "Disc image";
+    case GameFormat::kZarchive:
+      return "Archive";
+    case GameFormat::kXex:
+      return "Extracted";
+    default:
+      return "Unknown";
+  }
+}
+
+const char* const kSortLabels[] = {"Name", "Recently played", "Most played",
+                                   "Size", "Title ID"};
+constexpr int kSortCount = 5;
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// LibraryIconCache
+
+LibraryIconCache::LibraryIconCache(ui::ImGuiDrawer* imgui_drawer,
+                                   GameLibrary* library)
+    : imgui_drawer_(imgui_drawer), library_(library) {}
+
+LibraryIconCache::~LibraryIconCache() {
+  // The other dialogs deliberately leak their icon textures instead of
+  // destroying them; textures may still be referenced by frames in flight.
+  for (auto& entry : slots_) {
+    entry.second.texture.release();
+  }
+}
+
+ui::ImmediateTexture* LibraryIconCache::Get(uint32_t title_id) {
+  if (!title_id) {
+    return nullptr;
+  }
+  Slot& slot = slots_[title_id];
+  if (slot.texture) {
+    return slot.texture.get();
+  }
+  if (slot.checked && slot.checked_epoch == epoch_) {
+    return nullptr;
+  }
+  if (loads_this_frame_ >= kMaxIconLoadsPerFrame) {
+    return nullptr;  // Try again next frame.
+  }
+  ++loads_this_frame_;
+  slot.checked = true;
+  slot.checked_epoch = epoch_;
+
+  std::ifstream file(library_->IconPath(title_id), std::ios::binary);
+  if (!file.is_open()) {
+    return nullptr;
+  }
+  std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)),
+                            std::istreambuf_iterator<char>());
+  if (data.empty() || data.size() > kMaxIconFileSize) {
+    return nullptr;
+  }
+  slot.texture = imgui_drawer_->LoadImGuiIcon(data);
+  return slot.texture.get();
+}
+
+// ---------------------------------------------------------------------------
+// LibraryDialog
+
+LibraryDialog::LibraryDialog(ui::ImGuiDrawer* imgui_drawer,
+                             EmulatorWindow& emulator_window,
+                             GameLibrary& library, LibraryIconCache& icons,
+                             std::function<void()> on_closed)
+    : ui::ImGuiDialog(imgui_drawer),
+      emulator_window_(emulator_window),
+      library_(library),
+      icons_(icons),
+      on_closed_(std::move(on_closed)) {
+  view_ = cvars::library_view == "list" ? View::kList : View::kGrid;
+  if (cvars::library_sort == "recent") {
+    sort_ = Sort::kRecent;
+  } else if (cvars::library_sort == "played") {
+    sort_ = Sort::kMostPlayed;
+  } else if (cvars::library_sort == "size") {
+    sort_ = Sort::kSize;
+  } else if (cvars::library_sort == "titleid") {
+    sort_ = Sort::kTitleId;
+  } else {
+    sort_ = Sort::kName;
+  }
+  card_size_ = std::clamp(static_cast<int>(cvars::library_card_size),
+                          kMinCardSize, kMaxCardSize);
+}
+
+LibraryDialog::~LibraryDialog() { *alive_ = false; }
+
+void LibraryDialog::OnClose() {
+  if (on_closed_) {
+    on_closed_();
+  }
+}
+
+void LibraryDialog::Refresh() {
+  const uint64_t revision = library_.revision();
+  if (revision == seen_revision_) {
+    return;
+  }
+  seen_revision_ = revision;
+  games_ = library_.Games();
+  folders_ = library_.Folders();
+  favorite_count_ = 0;
+  recent_count_ = 0;
+  for (const GameEntry& game : games_) {
+    favorite_count_ += game.favorite ? 1 : 0;
+    recent_count_ += game.last_played > 0 ? 1 : 0;
+  }
+  if (filter_ == Filter::kFolder) {
+    const bool still_exists = std::any_of(
+        folders_.begin(), folders_.end(), [this](const LibraryFolder& folder) {
+          return folder.path == folder_filter_;
+        });
+    if (!still_exists) {
+      filter_ = Filter::kAll;
+    }
+  }
+  icons_.RetryMissing();
+  items_dirty_ = true;
+}
+
+bool LibraryDialog::SortLess(Sort sort, const GameEntry& a, const Item& item_a,
+                             const GameEntry& b, const Item& item_b) {
+  const auto by_name = [&]() {
+    if (item_a.lower_name != item_b.lower_name) {
+      return item_a.lower_name < item_b.lower_name;
+    }
+    return a.path < b.path;
+  };
+  switch (sort) {
+    case Sort::kRecent:
+      if (a.last_played != b.last_played) {
+        return a.last_played > b.last_played;
+      }
+      return by_name();
+    case Sort::kMostPlayed:
+      if (a.play_count != b.play_count) {
+        return a.play_count > b.play_count;
+      }
+      return by_name();
+    case Sort::kSize:
+      if (a.size_bytes != b.size_bytes) {
+        return a.size_bytes > b.size_bytes;
+      }
+      return by_name();
+    case Sort::kTitleId:
+      if (a.title_id != b.title_id) {
+        // Games with an unknown id go last.
+        if (a.title_id == 0 || b.title_id == 0) {
+          return a.title_id != 0;
+        }
+        return a.title_id < b.title_id;
+      }
+      return by_name();
+    default:
+      return by_name();
+  }
+}
+
+void LibraryDialog::RebuildItems() {
+  items_dirty_ = false;
+  items_.clear();
+  for (size_t i = 0; i < games_.size(); ++i) {
+    const GameEntry& game = games_[i];
+    switch (filter_) {
+      case Filter::kFavorites:
+        if (!game.favorite) continue;
+        break;
+      case Filter::kRecent:
+        if (game.last_played <= 0) continue;
+        break;
+      case Filter::kFolder:
+        if (!GameLibrary::IsUnderFolder(game.path, folder_filter_)) continue;
+        break;
+      default:
+        break;
+    }
+    Item item;
+    item.game_index = i;
+    item.name = game.DisplayName();
+    item.lower_name = launcher::ToLowerAscii(item.name);
+    item.search_text = item.lower_name + " " +
+                       launcher::ToLowerAscii(game.TitleIdHex()) + " " +
+                       launcher::ToLowerAscii(
+                           xe::path_to_utf8(game.path.filename()));
+    if (!launcher::ContainsInsensitive(item.search_text, applied_search_)) {
+      continue;
+    }
+    items_.push_back(std::move(item));
+  }
+  std::sort(items_.begin(), items_.end(),
+            [this](const Item& a, const Item& b) {
+              return SortLess(sort_, games_[a.game_index], a,
+                              games_[b.game_index], b);
+            });
+}
+
+const GameEntry* LibraryDialog::SelectedGame() const {
+  if (selected_path_.empty()) {
+    return nullptr;
+  }
+  for (const Item& item : items_) {
+    const GameEntry& game = games_[item.game_index];
+    if (game.path == selected_path_) {
+      return &game;
+    }
+  }
+  return nullptr;
+}
+
+const std::string& LibraryDialog::ItemLabel(Item& item, float max_width) {
+  if (item.label_width != max_width) {
+    item.label = FitText(item.name, max_width);
+    item.label_width = max_width;
+  }
+  return item.label;
+}
+
+void LibraryDialog::SetView(View view) {
+  if (view_ == view) {
+    return;
+  }
+  view_ = view;
+  SaveViewSettings();
+}
+
+void LibraryDialog::SetSort(Sort sort) {
+  if (sort_ == sort) {
+    return;
+  }
+  sort_ = sort;
+  items_dirty_ = true;
+  SaveViewSettings();
+}
+
+void LibraryDialog::SaveViewSettings() {
+  static const char* const kSortValues[] = {"name", "recent", "played", "size",
+                                            "titleid"};
+  SettingInfo info;
+  const auto apply = [&info](const char* name, const SettingValue& value) {
+    if (SettingsModel::Lookup(name, &info)) {
+      SettingsModel::Apply(info, value);
+    }
+  };
+  apply("library_view",
+        SettingValue(std::string(view_ == View::kList ? "list" : "grid")));
+  apply("library_sort",
+        SettingValue(std::string(kSortValues[static_cast<int>(sort_)])));
+  apply("library_card_size", SettingValue(static_cast<int32_t>(card_size_)));
+  SettingsModel::SaveGlobal();
+}
+
+void LibraryDialog::Launch(const GameEntry& game) {
+  if (launching_) {
+    return;
+  }
+  launching_ = true;
+  // RunTitle tears down all dialogs, this one included, so it must not run
+  // from inside this dialog's draw call.
+  const std::shared_ptr<bool> alive = alive_;
+  LibraryDialog* self = this;
+  EmulatorWindow* window = &emulator_window_;
+  const std::filesystem::path path = game.path;
+  emulator_window_.app_context().CallInUIThreadDeferred(
+      [alive, self, window, path]() {
+        window->RunTitle(path);
+        // If the launch failed without closing the library, allow retrying.
+        if (*alive) {
+          self->launching_ = false;
+        }
+      });
+}
+
+void LibraryDialog::RequestAddFolder() {
+  if (picking_folder_) {
+    return;
+  }
+  picking_folder_ = true;
+  // The native folder picker runs its own message loop, which must not happen
+  // inside an ImGui draw call.
+  const std::shared_ptr<bool> alive = alive_;
+  EmulatorWindow* window = &emulator_window_;
+  GameLibrary* library = &library_;
+  LibraryDialog* self = this;
+  emulator_window_.app_context().CallInUIThreadDeferred(
+      [alive, window, library, self]() {
+        if (!*alive) {
+          return;
+        }
+        auto picker = ui::FilePicker::Create();
+        picker->set_mode(ui::FilePicker::Mode::kOpen);
+        picker->set_type(ui::FilePicker::Type::kDirectory);
+        picker->set_multi_selection(false);
+        picker->set_title("Select a folder that contains your games");
+        std::filesystem::path chosen;
+        if (picker->Show(window->window())) {
+          const auto selected = picker->selected_files();
+          if (!selected.empty()) {
+            chosen = selected[0];
+          }
+        }
+        if (*alive) {
+          self->picking_folder_ = false;
+        }
+        if (!chosen.empty() && library->AddFolder(chosen, true)) {
+          library->Rescan();
+        }
+      });
+}
+
+void LibraryDialog::OpenRename(const GameEntry& game) {
+  rename_target_ = game.path;
+  const std::string current =
+      game.custom_name.empty() ? game.DisplayName() : game.custom_name;
+  std::snprintf(rename_buffer_, sizeof(rename_buffer_), "%s", current.c_str());
+  want_rename_ = true;
+}
+
+void LibraryDialog::OnDraw(ImGuiIO& io) {
+  icons_.BeginFrame();
+  Refresh();
+  if (items_dirty_) {
+    RebuildItems();
+  }
+
+  launcher::ScopedTheme theme;
+  const float s = launcher::UiScale();
+
+  ImGuiViewport* viewport = ImGui::GetMainViewport();
+  ImGui::SetNextWindowPos(viewport->WorkPos);
+  ImGui::SetNextWindowSize(viewport->WorkSize);
+  const ImGuiWindowFlags window_flags =
+      ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+      ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+      ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus;
+  if (!ImGui::Begin("##xenia_library", nullptr, window_flags)) {
+    ImGui::End();
+    return;
+  }
+
+  if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F, false)) {
+      focus_search_ = true;
+    }
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_R, false)) {
+      library_.Rescan();
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) && search_[0] != '\0') {
+      search_[0] = '\0';
+      applied_search_.clear();
+      items_dirty_ = true;
+    }
+  }
+
+  DrawTopBar();
+
+  const float status_height =
+      ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.y;
+  const float body_height =
+      std::max(60.0f * s, ImGui::GetContentRegionAvail().y - status_height);
+  const float total_width = ImGui::GetContentRegionAvail().x;
+  const float spacing = ImGui::GetStyle().ItemSpacing.x;
+  const float sidebar_width = 210.0f * s;
+  const bool show_details = total_width >= 1000.0f * s && !games_.empty();
+  const float details_width = show_details ? 300.0f * s : 0.0f;
+  const float games_width = std::max(
+      100.0f * s,
+      total_width - sidebar_width - details_width - spacing * (show_details ? 2 : 1));
+
+  DrawSidebar(sidebar_width, body_height);
+  ImGui::SameLine();
+  DrawGames(games_width, body_height);
+  if (show_details) {
+    ImGui::SameLine();
+    DrawDetails(details_width, body_height);
+  }
+  DrawStatusBar();
+  DrawPopups();
+
+  ImGui::End();
+}
+
+void LibraryDialog::DrawTopBar() {
+  const float s = launcher::UiScale();
+  const float available = ImGui::GetContentRegionAvail().x;
+
+  ImGui::AlignTextToFramePadding();
+  launcher::PushTitleFont();
+  ImGui::TextUnformatted("Library");
+  launcher::PopTitleFont();
+  ImGui::SameLine(0.0f, 20.0f * s);
+
+  if (focus_search_) {
+    ImGui::SetKeyboardFocusHere();
+    focus_search_ = false;
+  }
+  ImGui::SetNextItemWidth(std::clamp(available * 0.24f, 140.0f * s, 300.0f * s));
+  if (ImGui::InputTextWithHint("##search", "Search games  (Ctrl+F)", search_,
+                               sizeof(search_))) {
+    applied_search_ = launcher::ToLowerAscii(search_);
+    items_dirty_ = true;
+  }
+
+  ImGui::SameLine();
+  ImGui::SetNextItemWidth(160.0f * s);
+  if (ImGui::BeginCombo("##sort", kSortLabels[static_cast<int>(sort_)])) {
+    for (int i = 0; i < kSortCount; ++i) {
+      if (ImGui::Selectable(kSortLabels[i], static_cast<int>(sort_) == i)) {
+        SetSort(static_cast<Sort>(i));
+      }
+    }
+    ImGui::EndCombo();
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Sort order");
+  }
+
+  ImGui::SameLine();
+  for (int i = 0; i < 2; ++i) {
+    const bool active = (i == 0) == (view_ == View::kGrid);
+    if (i > 0) {
+      ImGui::SameLine(0.0f, 4.0f * s);
+    }
+    if (active) {
+      ImGui::PushStyleColor(ImGuiCol_Button, launcher::AccentColor(0.9f));
+    }
+    if (ImGui::Button(i == 0 ? "Grid" : "List")) {
+      SetView(i == 0 ? View::kGrid : View::kList);
+    }
+    if (active) {
+      ImGui::PopStyleColor();
+    }
+  }
+
+  // Right-aligned actions.
+  struct Action {
+    const char* label;
+    const char* tooltip;
+  };
+  const Action actions[] = {
+      {"Open File...", "Launch a game that is not in the library"},
+      {"Settings", "Emulator settings"},
+      {"Rescan", "Look for new and removed games (Ctrl+R)"},
+  };
+  const ImGuiStyle& style = ImGui::GetStyle();
+  float total = 0.0f;
+  for (const Action& action : actions) {
+    total += ImGui::CalcTextSize(action.label).x + style.FramePadding.x * 2.0f +
+             style.ItemSpacing.x;
+  }
+  ImGui::SameLine();
+  const float remaining = ImGui::GetContentRegionAvail().x;
+  if (remaining > total) {
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + remaining - total +
+                         style.ItemSpacing.x);
+  }
+  for (size_t i = 0; i < std::size(actions); ++i) {
+    if (i > 0) {
+      ImGui::SameLine();
+    }
+    const bool is_rescan = i == 2;
+    ImGui::BeginDisabled(is_rescan && library_.is_scanning());
+    if (ImGui::Button(actions[i].label)) {
+      if (i == 0) {
+        emulator_window_.PromptToOpenFile();
+      } else if (i == 1) {
+        emulator_window_.OpenSettingsDialog();
+      } else {
+        library_.Rescan();
+      }
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+      ImGui::SetTooltip("%s", actions[i].tooltip);
+    }
+  }
+  ImGui::Spacing();
+}
+
+void LibraryDialog::DrawSidebar(float width, float height) {
+  const float s = launcher::UiScale();
+  ImGui::BeginChild("##sidebar", ImVec2(width, height), ImGuiChildFlags_Borders);
+
+  const auto nav_entry = [this](const char* name, size_t count, Filter filter) {
+    char label[96];
+    std::snprintf(label, sizeof(label), "%s  (%zu)", name, count);
+    if (ImGui::Selectable(label, filter_ == filter)) {
+      filter_ = filter;
+      items_dirty_ = true;
+    }
+  };
+  nav_entry("All Games", games_.size(), Filter::kAll);
+  nav_entry("Favorites", favorite_count_, Filter::kFavorites);
+  nav_entry("Recently Played", recent_count_, Filter::kRecent);
+
+  ImGui::Spacing();
+  ImGui::Separator();
+  ImGui::Spacing();
+  ImGui::TextDisabled("GAME FOLDERS");
+  ImGui::Spacing();
+
+  std::filesystem::path folder_to_remove;
+  for (size_t i = 0; i < folders_.size(); ++i) {
+    const LibraryFolder& folder = folders_[i];
+    ImGui::PushID(static_cast<int>(i));
+    std::string name = xe::path_to_utf8(folder.path.filename());
+    if (name.empty()) {
+      name = xe::path_to_utf8(folder.path);
+    }
+    const bool selected =
+        filter_ == Filter::kFolder && folder_filter_ == folder.path;
+    if (ImGui::Selectable(FitText(name, width - 36.0f * s).c_str(), selected)) {
+      filter_ = Filter::kFolder;
+      folder_filter_ = folder.path;
+      items_dirty_ = true;
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+      const std::string full = xe::path_to_utf8(folder.path);
+      launcher::WrappedTooltip(
+          (full + (folder.recursive ? "\nIncluding subfolders"
+                                    : "\nThis folder only"))
+              .c_str());
+    }
+    if (ImGui::BeginPopupContextItem("##foldermenu")) {
+      if (ImGui::MenuItem("Include subfolders", nullptr, folder.recursive)) {
+        library_.SetFolderRecursive(folder.path, !folder.recursive);
+        library_.Rescan();
+      }
+      if (ImGui::MenuItem("Open in file manager")) {
+        xe::LaunchFileExplorer(folder.path);
+      }
+      ImGui::Separator();
+      if (ImGui::MenuItem("Remove folder and its games")) {
+        folder_to_remove = folder.path;
+      }
+      ImGui::EndPopup();
+    }
+    ImGui::PopID();
+  }
+  if (!folder_to_remove.empty()) {
+    if (filter_ == Filter::kFolder && folder_filter_ == folder_to_remove) {
+      filter_ = Filter::kAll;
+    }
+    library_.RemoveFolder(folder_to_remove);
+  }
+  if (folders_.empty()) {
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextDisabled("No folders yet. Add the folder where you keep your games.");
+    ImGui::PopTextWrapPos();
+  } else {
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextDisabled("Right-click a folder for options.");
+    ImGui::PopTextWrapPos();
+  }
+
+  ImGui::Spacing();
+  ImGui::BeginDisabled(picking_folder_);
+  if (launcher::AccentButton("+ Add Folder", ImVec2(-FLT_MIN, 0.0f))) {
+    RequestAddFolder();
+  }
+  ImGui::EndDisabled();
+
+  ImGui::EndChild();
+}
+
+void LibraryDialog::DrawGames(float width, float height) {
+  ImGui::BeginChild("##games", ImVec2(width, height), ImGuiChildFlags_Borders,
+                    view_ == View::kList ? ImGuiWindowFlags_NoScrollbar
+                                         : ImGuiWindowFlags_None);
+  if (items_.empty()) {
+    DrawEmptyState();
+  } else if (view_ == View::kGrid) {
+    DrawGrid(ImGui::GetContentRegionAvail().x);
+  } else {
+    DrawList();
+  }
+  ImGui::EndChild();
+}
+
+void LibraryDialog::DrawEmptyState() {
+  const float s = launcher::UiScale();
+  const float region_width = ImGui::GetContentRegionAvail().x;
+  ImGui::SetCursorPosY(ImGui::GetCursorPosY() +
+                       ImGui::GetContentRegionAvail().y * 0.25f);
+
+  const bool no_games_at_all = games_.empty();
+  if (no_games_at_all && folders_.empty()) {
+    launcher::PushTitleFont();
+    CenteredText("Add your games", region_width);
+    launcher::PopTitleFont();
+    ImGui::Spacing();
+    CenteredText("Choose a folder that contains your games and Xenia", region_width);
+    CenteredText("will find them. Supported: .iso, .zar and extracted", region_width);
+    CenteredText("games (default.xex).", region_width);
+    ImGui::Spacing();
+    ImGui::Spacing();
+    const float button_width = 220.0f * s;
+    ImGui::SetCursorPosX((region_width - button_width) * 0.5f);
+    ImGui::BeginDisabled(picking_folder_);
+    if (launcher::AccentButton("Add Game Folder", ImVec2(button_width, 0.0f))) {
+      RequestAddFolder();
+    }
+    ImGui::EndDisabled();
+    ImGui::SetCursorPosX((region_width - button_width) * 0.5f);
+    if (ImGui::Button("Open a Single File...", ImVec2(button_width, 0.0f))) {
+      emulator_window_.PromptToOpenFile();
+    }
+  } else if (no_games_at_all && library_.is_scanning()) {
+    CenteredText("Scanning your folders...", region_width);
+    ImGui::Spacing();
+    const std::string status = library_.ScanStatus();
+    ImGui::PushStyleColor(ImGuiCol_Text, launcher::DimTextColor());
+    CenteredText(FitText(status, region_width - 40.0f * s).c_str(), region_width);
+    ImGui::PopStyleColor();
+  } else if (no_games_at_all) {
+    launcher::PushTitleFont();
+    CenteredText("No games found", region_width);
+    launcher::PopTitleFont();
+    ImGui::Spacing();
+    CenteredText("Nothing in your folders looks like a game.", region_width);
+    CenteredText("Looking for .iso, .zar and extracted default.xex files.", region_width);
+    ImGui::Spacing();
+    const float button_width = 160.0f * s;
+    ImGui::SetCursorPosX((region_width - button_width) * 0.5f);
+    if (ImGui::Button("Rescan", ImVec2(button_width, 0.0f))) {
+      library_.Rescan();
+    }
+  } else {
+    CenteredText("No games match.", region_width);
+    ImGui::Spacing();
+    const float button_width = 160.0f * s;
+    if (!applied_search_.empty()) {
+      ImGui::SetCursorPosX((region_width - button_width) * 0.5f);
+      if (ImGui::Button("Clear search", ImVec2(button_width, 0.0f))) {
+        search_[0] = '\0';
+        applied_search_.clear();
+        items_dirty_ = true;
+      }
+    }
+    if (filter_ != Filter::kAll) {
+      ImGui::SetCursorPosX((region_width - button_width) * 0.5f);
+      if (ImGui::Button("Show all games", ImVec2(button_width, 0.0f))) {
+        filter_ = Filter::kAll;
+        items_dirty_ = true;
+      }
+    }
+  }
+}
+
+void LibraryDialog::HandleItemInteraction(const GameEntry& game,
+                                          const std::string& label,
+                                          const std::string& name) {
+  const bool text_input_active = ImGui::GetIO().WantTextInput;
+  if (ImGui::IsItemClicked(ImGuiMouseButton_Left) ||
+      ImGui::IsItemClicked(ImGuiMouseButton_Right) || ImGui::IsItemFocused()) {
+    selected_path_ = game.path;
+  }
+  if (ImGui::IsItemHovered() &&
+      ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+    Launch(game);
+  }
+  if (ImGui::IsItemFocused() && !text_input_active) {
+    if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
+        ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false) ||
+        ImGui::IsKeyPressed(ImGuiKey_GamepadFaceDown, false)) {
+      Launch(game);
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceUp, false)) {
+      library_.SetFavorite(game.path, !game.favorite);
+    }
+  }
+  if (label != name && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+    ImGui::SetTooltip("%s", name.c_str());
+  }
+  if (ImGui::BeginPopupContextItem("##gamemenu")) {
+    DrawItemContextMenu(game);
+    ImGui::EndPopup();
+  }
+}
+
+void LibraryDialog::DrawItemContextMenu(const GameEntry& game) {
+  if (ImGui::MenuItem("Play")) {
+    Launch(game);
+  }
+  ImGui::Separator();
+  if (ImGui::MenuItem(game.favorite ? "Remove from favorites"
+                                    : "Add to favorites")) {
+    library_.SetFavorite(game.path, !game.favorite);
+  }
+  if (ImGui::MenuItem("Rename...")) {
+    OpenRename(game);
+  }
+  ImGui::BeginDisabled(game.title_id == 0);
+  if (ImGui::MenuItem("Game settings...")) {
+    emulator_window_.OpenGameSettingsDialog(game.title_id, game.DisplayName());
+  }
+  ImGui::EndDisabled();
+  ImGui::Separator();
+  if (ImGui::MenuItem("Show in file manager")) {
+    xe::LaunchFileExplorer(game.path.parent_path());
+  }
+  if (ImGui::MenuItem("Copy path")) {
+    ImGui::SetClipboardText(xe::path_to_utf8(game.path).c_str());
+  }
+  ImGui::Separator();
+  if (ImGui::MenuItem("Remove from library")) {
+    library_.ExcludeGame(game.path);
+  }
+}
+
+void LibraryDialog::DrawGrid(float available_width) {
+  const float s = launcher::UiScale();
+  const ImGuiStyle& style = ImGui::GetStyle();
+  const float spacing = style.ItemSpacing.x;
+  const float card_width = static_cast<float>(card_size_) * s;
+  const float pad = 8.0f * s;
+  const float icon_size = card_width - pad * 2.0f;
+  const float line_height = ImGui::GetTextLineHeight();
+  const float card_height = pad + icon_size + 6.0f * s + line_height * 2.0f + pad;
+  const float text_width = card_width - pad * 2.0f;
+
+  const int columns = std::max(
+      1, static_cast<int>((available_width + spacing) / (card_width + spacing)));
+  const int count = static_cast<int>(items_.size());
+  const int rows = (count + columns - 1) / columns;
+
+  ImGuiListClipper clipper;
+  clipper.Begin(rows, card_height + style.ItemSpacing.y);
+  while (clipper.Step()) {
+    for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+      for (int column = 0; column < columns; ++column) {
+        const int index = row * columns + column;
+        if (index >= count) {
+          break;
+        }
+        if (column > 0) {
+          ImGui::SameLine();
+        }
+        Item& item = items_[static_cast<size_t>(index)];
+        const GameEntry& game = games_[item.game_index];
+        ImGui::PushID(static_cast<int>(item.game_index));
+
+        const bool selected = game.path == selected_path_;
+        ImGui::Selectable("##card", selected,
+                          ImGuiSelectableFlags_AllowDoubleClick,
+                          ImVec2(card_width, card_height));
+        const std::string& label = ItemLabel(item, text_width);
+        HandleItemInteraction(game, label, item.name);
+
+        const ImVec2 min = ImGui::GetItemRectMin();
+        ImDrawList* draw_list = ImGui::GetWindowDrawList();
+        const ImVec2 icon_min(min.x + pad, min.y + pad);
+        const ImVec2 icon_max(icon_min.x + icon_size, icon_min.y + icon_size);
+        if (ui::ImmediateTexture* icon = icons_.Get(game.title_id)) {
+          draw_list->AddImageRounded(reinterpret_cast<ImTextureID>(icon),
+                                     icon_min, icon_max, ImVec2(0.0f, 0.0f),
+                                     ImVec2(1.0f, 1.0f), IM_COL32_WHITE,
+                                     8.0f * s);
+        } else {
+          draw_list->AddRectFilled(icon_min, icon_max,
+                                   PlaceholderColor(item.name), 8.0f * s);
+          const char letter[2] = {PlaceholderLetter(item.name), '\0'};
+          ImFont* font = ImGui::GetFont();
+          const float font_size = ImGui::GetFontSize() * 2.6f;
+          const ImVec2 letter_size =
+              font->CalcTextSizeA(font_size, FLT_MAX, 0.0f, letter);
+          draw_list->AddText(
+              font, font_size,
+              ImVec2(icon_min.x + (icon_size - letter_size.x) * 0.5f,
+                     icon_min.y + (icon_size - letter_size.y) * 0.5f),
+              IM_COL32(255, 255, 255, 190), letter);
+        }
+        if (game.favorite) {
+          const ImVec2 center(icon_max.x - 12.0f * s, icon_min.y + 12.0f * s);
+          draw_list->AddCircleFilled(center, 11.0f * s, IM_COL32(0, 0, 0, 150));
+          DrawStar(draw_list, center, 7.5f * s, IM_COL32(255, 205, 60, 255),
+                   true);
+        }
+
+        const float text_y = icon_max.y + 6.0f * s;
+        draw_list->AddText(ImVec2(min.x + pad, text_y),
+                           ImGui::GetColorU32(ImGuiCol_Text), label.c_str());
+        const std::string subtitle =
+            game.last_played > 0
+                ? launcher::FormatRelativeTime(
+                      game.last_played, static_cast<int64_t>(std::time(nullptr)))
+                : (game.title_id ? game.TitleIdHex() : std::string("Not played"));
+        draw_list->AddText(ImVec2(min.x + pad, text_y + line_height),
+                           ImGui::GetColorU32(ImGuiCol_TextDisabled),
+                           FitText(subtitle, text_width).c_str());
+        ImGui::PopID();
+      }
+    }
+  }
+  clipper.End();
+}
+
+void LibraryDialog::DrawList() {
+  const ImGuiTableFlags flags =
+      ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+      ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_Resizable |
+      ImGuiTableFlags_SizingStretchProp;
+  ImGui::PushStyleVar(ImGuiStyleVar_CellPadding,
+                      ImVec2(8.0f * launcher::UiScale(), 5.0f * launcher::UiScale()));
+  if (!ImGui::BeginTable("##gamelist", 6, flags)) {
+    ImGui::PopStyleVar();
+    return;
+  }
+  ImGui::TableSetupScrollFreeze(0, 1);
+  ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 3.2f);
+  ImGui::TableSetupColumn("Title ID", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+  ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthStretch, 0.9f);
+  ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthStretch, 0.9f);
+  ImGui::TableSetupColumn("Last played", ImGuiTableColumnFlags_WidthStretch,
+                          1.2f);
+  ImGui::TableSetupColumn("Plays", ImGuiTableColumnFlags_WidthStretch, 0.6f);
+  ImGui::TableHeadersRow();
+
+  const int64_t now = static_cast<int64_t>(std::time(nullptr));
+  ImGuiListClipper clipper;
+  clipper.Begin(static_cast<int>(items_.size()));
+  while (clipper.Step()) {
+    for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
+      Item& item = items_[static_cast<size_t>(i)];
+      const GameEntry& game = games_[item.game_index];
+      ImGui::PushID(static_cast<int>(item.game_index));
+      ImGui::TableNextRow();
+      ImGui::TableSetColumnIndex(0);
+      const std::string title = (game.favorite ? "* " : "") + item.name;
+      ImGui::Selectable(title.c_str(), game.path == selected_path_,
+                        ImGuiSelectableFlags_SpanAllColumns |
+                            ImGuiSelectableFlags_AllowDoubleClick,
+                        ImVec2(0.0f, 0.0f));
+      HandleItemInteraction(game, title, title);
+      ImGui::TableSetColumnIndex(1);
+      ImGui::TextDisabled("%s",
+                          game.title_id ? game.TitleIdHex().c_str() : "-");
+      ImGui::TableSetColumnIndex(2);
+      ImGui::TextDisabled("%s", FormatName(game.format));
+      ImGui::TableSetColumnIndex(3);
+      ImGui::TextDisabled("%s", launcher::FormatBytes(game.size_bytes).c_str());
+      ImGui::TableSetColumnIndex(4);
+      ImGui::TextDisabled(
+          "%s", launcher::FormatRelativeTime(game.last_played, now).c_str());
+      ImGui::TableSetColumnIndex(5);
+      ImGui::TextDisabled("%u", game.play_count);
+      ImGui::PopID();
+    }
+  }
+  clipper.End();
+  ImGui::EndTable();
+  ImGui::PopStyleVar();
+}
+
+void LibraryDialog::DrawDetails(float width, float height) {
+  const float s = launcher::UiScale();
+  ImGui::BeginChild("##details", ImVec2(width, height), ImGuiChildFlags_Borders);
+  const GameEntry* game = SelectedGame();
+  if (!game) {
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + height * 0.35f);
+    ImGui::PushStyleColor(ImGuiCol_Text, launcher::DimTextColor());
+    CenteredText("Select a game", ImGui::GetContentRegionAvail().x);
+    CenteredText("to see its details.", ImGui::GetContentRegionAvail().x);
+    ImGui::PopStyleColor();
+    ImGui::EndChild();
+    return;
+  }
+
+  const float content_width = ImGui::GetContentRegionAvail().x;
+  const float icon_size = std::min(content_width, 150.0f * s);
+  const std::string name = game->DisplayName();
+  ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (content_width - icon_size) * 0.5f);
+  {
+    const ImVec2 min = ImGui::GetCursorScreenPos();
+    const ImVec2 max(min.x + icon_size, min.y + icon_size);
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+    if (ui::ImmediateTexture* icon = icons_.Get(game->title_id)) {
+      draw_list->AddImageRounded(reinterpret_cast<ImTextureID>(icon), min, max,
+                                 ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f),
+                                 IM_COL32_WHITE, 10.0f * s);
+    } else {
+      draw_list->AddRectFilled(min, max, PlaceholderColor(name), 10.0f * s);
+      const char letter[2] = {PlaceholderLetter(name), '\0'};
+      ImFont* font = ImGui::GetFont();
+      const float font_size = ImGui::GetFontSize() * 4.0f;
+      const ImVec2 letter_size =
+          font->CalcTextSizeA(font_size, FLT_MAX, 0.0f, letter);
+      draw_list->AddText(font, font_size,
+                         ImVec2(min.x + (icon_size - letter_size.x) * 0.5f,
+                                min.y + (icon_size - letter_size.y) * 0.5f),
+                         IM_COL32(255, 255, 255, 190), letter);
+    }
+    ImGui::Dummy(ImVec2(icon_size, icon_size));
+  }
+  ImGui::Spacing();
+  launcher::PushTitleFont();
+  ImGui::PushTextWrapPos(0.0f);
+  ImGui::TextUnformatted(name.c_str());
+  ImGui::PopTextWrapPos();
+  launcher::PopTitleFont();
+  ImGui::Spacing();
+
+  float label_column = 0.0f;
+  for (const char* label :
+       {"Title ID", "Type", "Size", "Last played", "Times played"}) {
+    label_column = std::max(label_column, ImGui::CalcTextSize(label).x);
+  }
+  // SameLine(offset) counts from the window edge, so include its padding.
+  label_column += ImGui::GetStyle().WindowPadding.x + 14.0f * s;
+  const auto row = [&](const char* label, const std::string& value) {
+    ImGui::TextDisabled("%s", label);
+    ImGui::SameLine(label_column);
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextUnformatted(value.c_str());
+    ImGui::PopTextWrapPos();
+  };
+  row("Title ID", game->title_id ? game->TitleIdHex() : "Unknown");
+  row("Type", FormatName(game->format));
+  row("Size", launcher::FormatBytes(game->size_bytes));
+  row("Last played",
+      launcher::FormatRelativeTime(game->last_played,
+                                   static_cast<int64_t>(std::time(nullptr))));
+  row("Times played", std::to_string(game->play_count));
+  ImGui::Spacing();
+  ImGui::PushStyleColor(ImGuiCol_Text, launcher::DimTextColor());
+  ImGui::PushTextWrapPos(0.0f);
+  ImGui::TextUnformatted(xe::path_to_utf8(game->path).c_str());
+  ImGui::PopTextWrapPos();
+  ImGui::PopStyleColor();
+  ImGui::Spacing();
+  ImGui::Separator();
+  ImGui::Spacing();
+
+  const ImVec2 full_width(-FLT_MIN, 0.0f);
+  if (launcher::AccentButton("Play", ImVec2(-FLT_MIN, ImGui::GetFrameHeight() * 1.3f))) {
+    Launch(*game);
+  }
+  if (ImGui::Button(game->favorite ? "Remove favorite" : "Add to favorites",
+                    full_width)) {
+    library_.SetFavorite(game->path, !game->favorite);
+  }
+  ImGui::BeginDisabled(game->title_id == 0);
+  if (ImGui::Button("Game settings...", full_width)) {
+    emulator_window_.OpenGameSettingsDialog(game->title_id, name);
+  }
+  ImGui::EndDisabled();
+  if (game->title_id == 0 &&
+      ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+    ImGui::SetTooltip(
+        "The title ID of this game could not be read, so it can't have its "
+        "own settings.");
+  }
+  if (ImGui::Button("Rename...", full_width)) {
+    OpenRename(*game);
+  }
+  ImGui::EndChild();
+}
+
+void LibraryDialog::DrawStatusBar() {
+  const float s = launcher::UiScale();
+  ImGui::AlignTextToFramePadding();
+  if (library_.is_scanning()) {
+    ImGui::TextDisabled("%s", FitText(library_.ScanStatus(),
+                                      ImGui::GetContentRegionAvail().x * 0.6f)
+                                  .c_str());
+  } else if (items_.size() != games_.size()) {
+    ImGui::TextDisabled("Showing %zu of %zu games", items_.size(),
+                        games_.size());
+  } else {
+    ImGui::TextDisabled("%zu games", games_.size());
+  }
+
+  if (view_ == View::kGrid && !games_.empty()) {
+    const float slider_width = 150.0f * s;
+    ImGui::SameLine();
+    const float remaining = ImGui::GetContentRegionAvail().x;
+    if (remaining > slider_width) {
+      ImGui::SetCursorPosX(ImGui::GetCursorPosX() + remaining - slider_width);
+    }
+    ImGui::SetNextItemWidth(slider_width);
+    ImGui::SliderInt("##cardsize", &card_size_, kMinCardSize, kMaxCardSize,
+                     "Card size %d");
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+      SaveViewSettings();
+    }
+  }
+}
+
+void LibraryDialog::DrawPopups() {
+  const float s = launcher::UiScale();
+  if (want_rename_) {
+    ImGui::OpenPopup("Rename game");
+    want_rename_ = false;
+  }
+  if (ImGui::BeginPopupModal("Rename game", nullptr,
+                             ImGuiWindowFlags_AlwaysAutoResize)) {
+    // ImGui doesn't dismiss modal popups with Esc by itself.
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+      ImGui::CloseCurrentPopup();
+    }
+    ImGui::TextUnformatted("Display name");
+    ImGui::SetNextItemWidth(380.0f * s);
+    if (ImGui::IsWindowAppearing()) {
+      ImGui::SetKeyboardFocusHere();
+    }
+    const bool submitted =
+        ImGui::InputText("##rename", rename_buffer_, sizeof(rename_buffer_),
+                         ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::TextDisabled("Leave empty to use the game's own name.");
+    ImGui::Spacing();
+    const bool save_clicked = launcher::AccentButton("Save");
+    if (save_clicked || submitted) {
+      library_.SetCustomName(rename_target_, rename_buffer_);
+      ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel")) {
+      ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+  }
+}
+
+}  // namespace app
+}  // namespace xe

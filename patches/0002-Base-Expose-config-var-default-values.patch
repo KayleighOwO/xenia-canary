@@ -1,0 +1,58 @@
+From b8ce249c91848084e57f0e33ee86ddb34495de41 Mon Sep 17 00:00:00 2001
+From: Xenia UI <ui@example.invalid>
+Date: Sat, 3 Oct 2026 01:58:40 +0000
+Subject: [PATCH 02/10] [Base] Expose config var default values
+
+Add IConfigVar::default_value_string() and ConfigVar<T>::GetTypedDefaultValue()
+so tools (such as a settings UI) can show which options differ from their
+defaults and reset them. Purely additive.
+---
+ src/xenia/base/cvar.h | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/src/xenia/base/cvar.h b/src/xenia/base/cvar.h
+index 8d2617409..7c928a4b2 100644
+--- a/src/xenia/base/cvar.h
++++ b/src/xenia/base/cvar.h
+@@ -51,6 +51,9 @@ class IConfigVar : virtual public ICommandVar {
+   virtual const std::string& category() const = 0;
+   virtual bool is_transient() const = 0;
+   virtual std::string config_value() const = 0;
++  // The compiled-in default, formatted exactly like config_value(), so the two
++  // can be compared to tell whether the user has changed the variable.
++  virtual std::string default_value_string() const = 0;
+   virtual void LoadConfigValue(const toml::node* result) = 0;
+   virtual void LoadGameConfigValue(const toml::node* result) = 0;
+   virtual void ResetConfigValueToDefault() = 0;
+@@ -86,7 +89,9 @@ class ConfigVar : public CommandVar<T>, virtual public IConfigVar {
+   ConfigVar<T>(const char* name, T* default_value, const char* description,
+                const char* category, bool is_transient);
+   std::string config_value() const override;
++  std::string default_value_string() const override;
+   const T& GetTypedConfigValue() const;
++  const T& GetTypedDefaultValue() const;
+   const std::string& category() const override;
+   bool is_transient() const override;
+   void AddToLaunchOptions(cxxopts::Options* options) override;
+@@ -280,10 +285,18 @@ std::string ConfigVar<T>::config_value() const {
+   return this->ToString(this->default_value_);
+ }
+ template <class T>
++std::string ConfigVar<T>::default_value_string() const {
++  return this->ToString(this->default_value_);
++}
++template <class T>
+ const T& ConfigVar<T>::GetTypedConfigValue() const {
+   return config_value_ ? *config_value_ : this->default_value_;
+ }
+ template <class T>
++const T& ConfigVar<T>::GetTypedDefaultValue() const {
++  return this->default_value_;
++}
++template <class T>
+ void CommandVar<T>::SetCommandLineValue(const T val) {
+   commandline_value_ = std::make_unique<T>(val);
+   UpdateValue();
+-- 
+2.43.0
+

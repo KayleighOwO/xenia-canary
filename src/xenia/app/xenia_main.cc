@@ -119,6 +119,7 @@ DEFINE_bool(mount_memory_unit, false, "Enable memory unit (MU) mount",
             "Storage");
 
 DECLARE_bool(force_mount_devkit);
+DECLARE_bool(library_show_on_startup);
 
 DEFINE_transient_path(target, "",
                       "Specifies the target .xex or .iso to execute.",
@@ -770,15 +771,24 @@ void EmulatorApp::EmulatorThread() {
   auto xam = emulator_->kernel_state()->GetKernelModule<kernel::xam::XamModule>(
       "xam.xex");
 
+  bool launching_loader_target = false;
   if (xam) {
     xam->LoadLoaderData();
 
     if (!xam->loader_data().host_path.empty()) {
+      launching_loader_target = true;
       const std::filesystem::path host_path = xam->loader_data().host_path;
       app_context().CallInUIThread([this, host_path]() {
         return emulator_window_->RunTitle(host_path);
       });
     }
+  }
+
+  // Nothing to run: start in the game library.
+  if (path.empty() && !launching_loader_target &&
+      cvars::library_show_on_startup) {
+    app_context().CallInUIThread(
+        [this]() { emulator_window_->ShowLibraryDialog(); });
   }
 
   // Now, we're going to use this thread to drive events related to emulation.

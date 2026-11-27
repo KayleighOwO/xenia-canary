@@ -22,6 +22,9 @@
 
 #include "xenia/app/console_settings_dialog.h"
 #include "xenia/app/content_list_dialog.h"
+#include "xenia/app/game_library.h"
+#include "xenia/app/library_dialog.h"
+#include "xenia/app/settings_dialog.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
@@ -196,6 +199,11 @@ EmulatorWindow::EmulatorWindow(Emulator* emulator,
                 ")";
 
   LoadRecentlyLaunchedTitles();
+
+  game_library_ = std::make_unique<GameLibrary>(emulator_->storage_root());
+  game_library_->Load();
+  library_icons_ = std::make_unique<LibraryIconCache>(imgui_drawer_.get(),
+                                                      game_library_.get());
 }
 
 std::unique_ptr<EmulatorWindow> EmulatorWindow::Create(
@@ -789,6 +797,10 @@ bool EmulatorWindow::Initialize() {
   FillRecentlyLaunchedTitlesMenu(recent_menu.get());
   {
     file_menu->AddChild(
+        MenuItem::Create(MenuItem::Type::kString, "Game &Library",
+                         std::bind(&EmulatorWindow::ToggleLibraryDialog, this)));
+    file_menu->AddChild(MenuItem::Create(MenuItem::Type::kSeparator));
+    file_menu->AddChild(
         MenuItem::Create(MenuItem::Type::kString, "&Open...", "Ctrl+O",
                          std::bind(&EmulatorWindow::FileOpen, this)));
     file_menu->AddChild(std::move(recent_menu));
@@ -806,6 +818,10 @@ bool EmulatorWindow::Initialize() {
         MenuItem::Create(MenuItem::Type::kString, "Close",
                          std::bind(&EmulatorWindow::FileClose, this)));
 #endif  // #ifdef DEBUG
+    file_menu->AddChild(MenuItem::Create(MenuItem::Type::kSeparator));
+    file_menu->AddChild(
+        MenuItem::Create(MenuItem::Type::kString, "&Settings...",
+                         std::bind(&EmulatorWindow::OpenSettingsDialog, this)));
     file_menu->AddChild(MenuItem::Create(MenuItem::Type::kSeparator));
     file_menu->AddChild(MenuItem::Create(
         MenuItem::Type::kString, "Show content directory...",
@@ -1078,6 +1094,12 @@ void EmulatorWindow::ApplyDisplayConfigForCvars() {
 
 void EmulatorWindow::OnKeyDown(ui::KeyEvent& e) {
   if (!emulator_initialized_) {
+    return;
+  }
+
+  // Typing into a text field (e.g. in an ImGui dialog) must not also trigger
+  // hotkeys such as the numpad CPU time scalar keys.
+  if (imgui_drawer_ && imgui_drawer_->GetIO().WantTextInput) {
     return;
   }
 
@@ -1759,6 +1781,66 @@ void EmulatorWindow::ToggleContentListDialog() {
   }
 }
 
+void EmulatorWindow::ShowLibraryDialog() {
+  if (library_dialog_ || emulator_->is_title_open()) {
+    return;
+  }
+  if (!library_scanned_) {
+    library_scanned_ = true;
+    if (!game_library_->Folders().empty()) {
+      game_library_->Rescan();
+    }
+  }
+  // The dialog deletes itself when it closes; let go of it first.
+  library_dialog_ = std::make_unique<LibraryDialog>(
+      imgui_drawer_.get(), *this, *game_library_, *library_icons_,
+      [this]() { static_cast<void>(library_dialog_.release()); });
+}
+
+void EmulatorWindow::ToggleLibraryDialog() {
+  if (library_dialog_) {
+    library_dialog_.reset();
+  } else {
+    ShowLibraryDialog();
+  }
+}
+
+void EmulatorWindow::RestoreLibraryDialog() {
+  if (emulator_->is_title_open()) {
+    return;
+  }
+  ShowLibraryDialog();
+}
+
+void EmulatorWindow::OpenSettingsDialog() {
+  settings_dialog_.reset();
+  settings_dialog_ = std::make_unique<SettingsDialog>(
+      imgui_drawer_.get(), *this,
+      [this]() { static_cast<void>(settings_dialog_.release()); });
+}
+
+void EmulatorWindow::OpenGameSettingsDialog(uint32_t title_id,
+                                            std::string title_name) {
+  settings_dialog_.reset();
+  settings_dialog_ = std::make_unique<SettingsDialog>(
+      imgui_drawer_.get(), *this, title_id, std::move(title_name),
+      [this]() { static_cast<void>(settings_dialog_.release()); });
+}
+
+void EmulatorWindow::PromptToOpenFile() {
+  app_context_.CallInUIThreadDeferred([this]() { FileOpen(); });
+}
+
+void EmulatorWindow::RecordLibraryLaunch(const std::filesystem::path& path) {
+  std::vector<uint8_t> icon;
+  if (kernel::util::GameInfoDatabase* database =
+          emulator_->game_info_database()) {
+    icon = database->GetIcon();
+  }
+  game_library_->RecordLaunch(path, emulator_->title_id(),
+                              emulator_->title_name(), icon);
+}
+
 void EmulatorWindow::ToggleControllerVibration() {
   auto input_sys = emulator()->input_system();
   if (input_sys) {
@@ -2327,6 +2409,7 @@ xe::X_STATUS EmulatorWindow::RunTitle(
     XELOGE("{}", log_msg);
 
     ClearDialogs();
+    RestoreLibraryDialog();
 
     xe::ui::ImGuiDialog::ShowMessageBox(imgui_drawer_.get(),
                                         "Title Launch Failed!", log_msg);
@@ -2369,6 +2452,9 @@ xe::X_STATUS EmulatorWindow::RunTitle(
   if (result) {
     XELOGE("Failed to launch target: {:08X}", result);
 
+    // Before the message box, so the message stays on top of the library.
+    RestoreLibraryDialog();
+
     xe::ui::ImGuiDialog::ShowMessageBox(
         imgui_drawer_.get(), "Title Launch Failed!",
         "Failed to launch title.\n\nCheck xenia.log for technical details.");
@@ -2376,6 +2462,7 @@ xe::X_STATUS EmulatorWindow::RunTitle(
     emulator_->file_system()->Clear();
   } else {
     AddRecentlyLaunchedTitle(path_to_file, emulator_->title_name());
+    RecordLibraryLaunch(abs_path);
 
     auto xam =
         emulator_->kernel_state()->GetKernelModule<kernel::xam::XamModule>(
@@ -2495,6 +2582,14 @@ void EmulatorWindow::AddRecentlyLaunchedTitle(
 }
 
 void EmulatorWindow::ClearDialogs() {
+  if (settings_dialog_) {
+    settings_dialog_.reset();
+  }
+
+  if (library_dialog_) {
+    library_dialog_.reset();
+  }
+
   if (profile_config_dialog_) {
     profile_config_dialog_.reset();
   }
